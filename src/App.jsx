@@ -690,12 +690,14 @@ function RoundStatus({ round }) {
       if (round.objectiveMode === "dual") {
         const baseB = (round.objB || (baseA === "TIME" ? "COST" : "CO2")).toUpperCase();
         return [
+          "Start at S and reach T.",
           `Objective: minimize α·${baseA} + (1−α)·${baseB}`,
           "Click nodes along directed edges only.",
           "Submit at T before timer ends.",
         ];
       }
       return [
+        "Start at S and reach T.",
         `Objective: minimize ${baseA}`,
         "Click nodes along directed edges only.",
         "Submit at T before timer ends.",
@@ -706,6 +708,7 @@ function RoundStatus({ round }) {
         "TSP: start at S, visit every node exactly once, return to S.",
         "Distances are Euclidean. No revisits (except final S).",
         "See the Leg Distances panel below the map.",
+        "Submit only when tour is complete.",
       ];
     }
     if (mode === "vrp") {
@@ -715,12 +718,14 @@ function RoundStatus({ round }) {
         "Click customers in sequence; click S anytime to return and reset load.",
         "App auto-splits routes when capacity would overflow.",
         "See current load and leg distances below the map.",
+        "Submit after all customers are served and you're back at S.",
       ];
     }
     return [
       "Warehouse Picking: start at S (Dock), visit all picks, return to S.",
       "Distance is Manhattan (grid) — no diagonals.",
       "Use the Leg Distances panel for step-by-step totals.",
+      "Submit when all picks are visited and you're back at S.",
     ];
   })();
 
@@ -937,6 +942,9 @@ function PlayCard({ me, round, onRoundUpdate }) {
   const [path, setPath] = useState([scenario.start || "S"]);
   const currentNode = path[path.length - 1];
 
+  // Precompute cost for SP path separately to keep hooks top-level
+  const spPathCost = useMemo(() => computePathCost(path, graphEdges), [path, graphEdges]);
+
   // Precompute leg lists (for panels)
   const legsTsp = useMemo(() => computeLegsEuclid(path, scenario.nodes), [path, scenario.nodes]);
   const legsPick = useMemo(() => computeLegsManhattan(path, scenario.nodes), [path, scenario.nodes]);
@@ -964,7 +972,7 @@ function PlayCard({ me, round, onRoundUpdate }) {
   let totalCost = 0, canSubmit = false, objectiveText = "";
 
   if (round.gameMode === "sp") {
-    totalCost = useMemo(() => computePathCost(path, graphEdges), [path, graphEdges]);
+    totalCost = spPathCost;
     objectiveText = round.objectiveMode === "dual"
       ? `minimize α·${round.objA.toUpperCase()} + (1−α)·${round.objB.toUpperCase()}`
       : `minimize ${(round.objA || scenario.objective).toUpperCase()}`;
