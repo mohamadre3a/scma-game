@@ -20,6 +20,27 @@ It helps students wake up in morning lectures and learn key logistics concepts b
 
 ---
 
+## 🎮 How to Play & Score
+
+1. Instructor starts a round and chooses a scenario.
+2. Students join with their **username + PIN** and see a countdown timer.
+3. Click nodes to build a valid route; use the **Undo** button to backtrack.
+4. Submit your route before time runs out.
+
+### Game goals
+- **Shortest Path:** go from start **S** to target **T** while minimizing the chosen metric (time, cost, or CO₂).
+- **Traveling Salesperson:** start at **S**, visit every node once, and return to **S**.
+- **Vehicle Routing:** serve all customers without exceeding vehicle capacity; return to the depot to reload.
+- **Order Picking:** walk the warehouse grid, collect all picks, and return to the dock.
+
+### Score calculation
+- **Base:** `1000 × (optimal cost ÷ your cost)`.
+- **Time bonus:** `max(0, 200 − seconds used)`.
+- **Total score:** base + time bonus (higher is better).
+- **Goal:** maximize your score to rank high and earn season points (`20 − place`).
+
+---
+
 ## 🚀 Setup (Local Development)
 
 1. Clone this repo:
@@ -95,7 +116,7 @@ Custom domain? Point `scma.shahsahebi.com` (CNAME) → Vercel.
 - **Rules:**
   - Click customers in sequence.
   - Click **S** to return/reset load.
-  - App auto-splits routes if load would exceed Q.
+  - App prevents moves that would exceed Q.
 - **Status:** Panel shows **current load** and per-leg distances.
 
 ---
@@ -109,9 +130,9 @@ Custom domain? Point `scma.shahsahebi.com` (CNAME) → Vercel.
 
 ## 🏆 Scoring
 
-- **Round Score:** based on solution quality vs optimal/baseline + speed bonus.
-- **Season Points:**  
-  - Placement → `20 – rank`.  
+- **Round Score:** `score = 1000 × (baseline / your cost) + max(0, 200 − time in seconds)`.
+- **Season Points:**
+  - Placement → `20 – rank`.
   - Example: 1st = 19 pts, 5th = 15 pts, ≥20th = 0.
 - Non-submitters get **0**.
 
