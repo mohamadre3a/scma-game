@@ -158,10 +158,35 @@ const LS_KEY = "scma-dash-store";
 function loadStore() { try { return JSON.parse(localStorage.getItem(LS_KEY) || "{}"); } catch { return {}; } }
 function saveStore(data) { localStorage.setItem(LS_KEY, JSON.stringify(data)); }
 
-function loadRoomRound(room) { const s = loadStore(); return s["room:" + room] || null; }
-function saveRoomRound(room, round) { const s = loadStore(); if (round) s["room:" + room] = round; else delete s["room:" + room]; saveStore(s); }
+// Async load/save now use Supabase. Keep simple local cache for fast UI.
+async function loadRoomRound(room) {
+  const cached = localStorage.getItem(`scma_round_${room}`);
+  if (cached) {
+    // refresh in background
+    dbLoadCurrentRound(room).then((fresh) => {
+      if (fresh) localStorage.setItem(`scma_round_${room}`, JSON.stringify(fresh));
+    });
+    return JSON.parse(cached);
+  }
+  const fresh = await dbLoadCurrentRound(room);
+  if (fresh) localStorage.setItem(`scma_round_${room}`, JSON.stringify(fresh));
+  return fresh;
+}
 
-function loadSeason(room) { const s = loadStore(); return s["season:" + room] || { totals: {}, history: [] }; }
+async function saveRoomRound(room, round) {
+  if (!round) localStorage.removeItem(`scma_round_${room}`);
+  else localStorage.setItem(`scma_round_${room}`, JSON.stringify(round));
+  await dbSaveRound(room, round);
+}
+
+async function loadSeason(room) {
+  // returns { totals: {name: points}, history: [] } (adapted for your UI)
+  const rows = await dbLoadSeasonTotals(room);
+  const totals = {};
+  for (const r of rows) totals[r.username] = r.points;
+  return { totals, history: [] };
+}
+
 function saveSeason(room, season) { const s = loadStore(); s["season:" + room] = season; saveStore(s); }
 
 function addToRoster(room, name) {
@@ -197,22 +222,35 @@ export default function App() {
   };
 
   const onLeave = () => {
-    const s = loadStore();
-    delete s.me; saveStore(s);
-    setMe(null); setRole("player"); setPinOk(false);
-  };
+  const s = loadStore();
+  delete s.me; saveStore(s);
+  localStorage.removeItem("scma_me"); // also clear PIN login memory
+  setMe(null); setRole("player"); setPinOk(false);
+};
+
 
   return (
     <div className="min-h-screen w-full bg-gradient-to-br from-indigo-950 via-slate-900 to-emerald-900 text-slate-100 px-4 py-6">
       <div className="mx-auto max-w-6xl">
         <Header me={me} role={role} setRole={setRole} pinOk={pinOk} setPinOk={setPinOk} onLeave={onLeave} />
+        
         {!me ? (
-          <Lobby onJoin={onJoin} defaultRoom={room} />
+          <LoginGate
+            onLogin={(profile) => {
+              // Keep using your existing store shape for compatibility
+              const s = loadStore();
+              s.me = { name: profile.name, room: profile.room };
+              saveStore(s);
+              setMe(s.me);
+              setRoom(s.me.room);
+            }}
+          />
         ) : role === "instructor" && pinOk ? (
           <InstructorPanel room={me.room} />
         ) : (
           <PlayerPanel me={me} />
         )}
+
         <Footer />
       </div>
     </div>
@@ -381,54 +419,63 @@ function InstructorPanel({ room }) {
       ? makeVrpScenario(vrpCustomers, vrpCapacity)
       : makePickingScenario(pickRows, pickCols, pickCount);
 
-  const onOpen = () => {
-    const id = Math.random().toString(36).slice(2, 8).toUpperCase();
-    const now = Date.now();
-    const endsAt = countdownSec > 0 ? now + countdownSec * 1000 : null;
+  const onOpen = async () => {
+  const id = Math.random().toString(36).slice(2, 8).toUpperCase();
+  const now = Date.now();
+  const endsAt = countdownSec > 0 ? now + countdownSec * 1000 : null;
 
-    let payload;
-    if (gameMode === "sp") {
-      payload = {
-        scenarioId: selScenario,
-        customScenario:
-          selScenario === "custom"
-            ? (customScenario || makeCustomScenario(customNodes, customObjective, {
-                spread: customSpread, density: customDensity, height: 360, minDist: 44
-              }))
-            : null,
-        objectiveMode: objMode,
-        objA, objB, alpha,
-      };
-    } else if (gameMode === "tsp") {
-      payload = { scenarioId: "tsp", customScenario: makeTspScenario(tspNodes) };
-    } else if (gameMode === "vrp") {
-      payload = { scenarioId: "vrp", customScenario: makeVrpScenario(vrpCustomers, vrpCapacity) };
-    } else {
-      payload = { scenarioId: "pick", customScenario: makePickingScenario(pickRows, pickCols, pickCount) };
-    }
-
-    const newRound = {
-      id, room,
-      isOpen: true, revealBoard: false, players: {},
-      startedAt: now, endsAt, durationSec: countdownSec, scored: false,
-      gameMode,
-      ...payload,
+  let payload;
+  if (gameMode === "sp") {
+    payload = {
+      scenarioId: selScenario,
+      customScenario:
+        selScenario === "custom"
+          ? (customScenario || makeCustomScenario(customNodes, customObjective, {
+              spread: customSpread, density: customDensity, height: 360, minDist: 44
+            }))
+          : null,
+      objectiveMode: objMode,
+      objA, objB, alpha,
     };
-    saveRoomRound(room, newRound);
-    setRound(newRound);
+  } else if (gameMode === "tsp") {
+    payload = { scenarioId: "tsp", customScenario: makeTspScenario(tspNodes) };
+  } else if (gameMode === "vrp") {
+    payload = { scenarioId: "vrp", customScenario: makeVrpScenario(vrpCustomers, vrpCapacity) };
+  } else {
+    payload = { scenarioId: "pick", customScenario: makePickingScenario(pickRows, pickCols, pickCount) };
+  }
+
+  const newRound = {
+    id, room,
+    isOpen: true, revealBoard: false, players: {},
+    startedAt: now, endsAt, durationSec: countdownSec, scored: false,
+    gameMode,
+    ...payload,
   };
 
-  const onClose = () => {
-    if (!round) return;
-    const r = { ...round, isOpen: false };
-    saveRoomRound(room, r); setRound(r);
-  };
-  const onReveal = () => {
-    if (!round) return;
-    const r = { ...round, revealBoard: true };
-    saveRoomRound(room, r); setRound(r);
-  };
-  const onReset = () => { saveRoomRound(room, null); setRound(null); };
+  await saveRoomRound(room, newRound);
+  setRound(newRound);
+};
+
+  const onClose = async () => {
+  if (!round) return;
+  const r = { ...round, isOpen: false };
+  await saveRoomRound(room, r);
+  setRound(r);
+};
+
+  const onReveal = async () => {
+  if (!round) return;
+  const r = { ...round, revealBoard: true };
+  await saveRoomRound(room, r);
+  setRound(r);
+};
+
+  const onReset = async () => {
+  await saveRoomRound(room, null);
+  setRound(null);
+};
+
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -760,7 +807,15 @@ function ClosedCard() {
 }
 
 function Leaderboards({ room, round }) {
-  const season = loadSeason(room);
+  const [season, setSeason] = useState({ totals: {}, history: [] });
+
+  useEffect(() => {
+    (async () => {
+      const s = await loadSeason(room);
+      setSeason(s || { totals: {}, history: [] });
+    })();
+  }, [room, round?.id]);
+
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
       <RoundLeaderboardCard room={room} round={round} />
@@ -768,6 +823,7 @@ function Leaderboards({ room, round }) {
     </div>
   );
 }
+
 
 function RoundLeaderboardCard({ room, round }) {
   const s = getScenarioFromRound(round);
@@ -840,12 +896,11 @@ function ExportCsvButtonRound({ round }) {
   );
 }
 
-
 function ExportCsvButtonSeason({ room }) {
-  const onExport = () => {
-    const season = loadSeason(room);
+  const onExport = async () => {
+    const s = await loadSeason(room);
     const rows = [["name","points"]];
-    for (const [name, pts] of Object.entries(season.totals || {})) {
+    for (const [name, pts] of Object.entries(s?.totals || {})) {
       rows.push([name, pts]);
     }
     const csv = rows.map(row => row.map(csvEscape).join(",")).join("\n");
@@ -857,6 +912,7 @@ function ExportCsvButtonSeason({ room }) {
     </button>
   );
 }
+
 
 
 function Medal({ rank }) { const m = rank === 1 ? "🥇" : rank === 2 ? "🥈" : rank === 3 ? "🥉" : ""; return <div className="text-2xl w-8 text-center">{m}</div>; }
@@ -874,17 +930,35 @@ function PlayCard({ me, round, onRoundUpdate }) {
   }, [round.startedAt]);
   const timeLeft = round.endsAt ? Math.max(0, Math.ceil((round.endsAt - Date.now()) / 1000)) : null;
 
-  // graph (SP only) — hooks must be top-level
+  // graph (SP) — hooks top-level only
   const { graphEdges, optCost: spOptCost } = useWeightedScenario(scenario, round);
   const spAdj = useMemo(() => new Set(graphEdges.map(([u, v]) => `${u}>${v}`)), [graphEdges]);
 
   const [path, setPath] = useState([scenario.start || "S"]);
   const currentNode = path[path.length - 1];
 
-  // Precompute leg lists for TSP/VRP/Picking (safe at top-level)
+  // Precompute leg lists (for panels)
   const legsTsp = useMemo(() => computeLegsEuclid(path, scenario.nodes), [path, scenario.nodes]);
   const legsPick = useMemo(() => computeLegsManhattan(path, scenario.nodes), [path, scenario.nodes]);
   const legsVrp  = useMemo(() => computeLegsVrp(path, scenario), [path, scenario]);
+
+  // ===== NEW: TSP next-step distance hints =====
+  const tspHintLines = useMemo(() => {
+    if (round.gameMode !== "tsp") return [];
+    const map = Object.fromEntries(scenario.nodes.map(n => [n.id, n]));
+    const here = map[currentNode] || map["S"];
+    if (!here) return [];
+    const unvisited = scenario.nodes.filter(n => n.id !== "S" && !path.includes(n.id));
+    const hints = unvisited.map(n => ({
+      from: currentNode, to: n.id,
+      label: Math.round(Math.hypot(here.x - n.x, here.y - n.y))
+    }));
+    if (unvisited.length === 0 && currentNode !== "S") {
+      const s = map["S"];
+      hints.push({ from: currentNode, to: "S", label: Math.round(Math.hypot(here.x - s.x, here.y - s.y)) });
+    }
+    return hints.sort((a, b) => a.label - b.label);
+  }, [round.gameMode, scenario.nodes, currentNode, path]);
 
   // totals + submit rules per mode
   let totalCost = 0, canSubmit = false, objectiveText = "";
@@ -945,25 +1019,25 @@ function PlayCard({ me, round, onRoundUpdate }) {
     round.gameMode === "vrp" ? vrpBaselineCost(scenario) :
     pickBaselineCost(scenario);
 
-  const onSubmit = () => {
-    if (!canSubmit || submitted) return;
-    const timeSec = elapsed;
-    const base = Math.max(1, Math.round(1000 * (optCost / Math.max(1, totalCost))));
-    const timeBonus = Math.max(0, 200 - timeSec);
-    const score = base + timeBonus;
+  const onSubmit = async () => {
+  if (!canSubmit || submitted) return;
+  const timeSec = elapsed;
+  const base = Math.max(1, Math.round(1000 * (optCost / Math.max(1, totalCost))));
+  const timeBonus = Math.max(0, 200 - timeSec);
+  const score = base + timeBonus;
 
-    const r = loadRoomRound(round.room || "SCMA") || round;
-    r.players = r.players || {};
-    r.players[me.name] = { cost: Math.round(totalCost), timeSec, score, path };
-    saveRoomRound(me.room, r);
-    onRoundUpdate(r);
-    setSubmitted(true);
-  };
+  const r = (await loadRoomRound(round.room || "SCMA")) || round;
+  r.players = r.players || {};
+  r.players[me.name] = { cost: Math.round(totalCost), timeSec, score, path };
 
-  // current VRP load (since last depot)
-  const currentLoad = round.gameMode === "vrp"
-    ? legsVrp.length ? legsVrp[legsVrp.length - 1].loadAfter : 0
-    : 0;
+  if (typeof dbUpsertSubmission === "function") {
+    await dbUpsertSubmission(round.id, me.name, { cost: Math.round(totalCost), timeSec, score, path });
+  }
+  await saveRoomRound(me.room, r);
+  onRoundUpdate(r);
+  setSubmitted(true);
+};
+
 
   // Which leg list to show
   const legList = round.gameMode === "tsp" ? legsTsp
@@ -989,7 +1063,12 @@ function PlayCard({ me, round, onRoundUpdate }) {
         </div>
 
         <div className="overflow-hidden rounded-xl bg-black/20 border border-white/10">
-          <SvgMap scenario={scenario} path={path} onClickNode={onClickNode} />
+          <SvgMap
+            scenario={scenario}
+            path={path}
+            onClickNode={onClickNode}
+            hintLines={round.gameMode === "tsp" ? tspHintLines : []}
+          />
         </div>
 
         {/* Numbers & legs */}
@@ -1008,13 +1087,32 @@ function PlayCard({ me, round, onRoundUpdate }) {
           {round.gameMode === "vrp" && (
             <div className="rounded-xl bg-white/5 p-3">
               <div className="text-sm text-slate-300">Current Load</div>
-              <div className="text-xl font-bold">{currentLoad} / {scenario.capacity}</div>
+              <div className="text-xl font-bold">
+                {legList.length ? legList[legList.length - 1].loadAfter : 0} / {scenario.capacity}
+              </div>
               <div className="text-xs text-slate-400 mt-1">Click S anytime to return and reset load.</div>
             </div>
           )}
         </div>
 
-        {legList.length > 0 && (
+        {/* Next-step distances (TSP) */}
+        {round.gameMode === "tsp" && (
+          <div className="mt-4 rounded-xl bg-white/5 p-3">
+            <div className="text-xs font-semibold mb-2">Next-step distances from {currentNode}</div>
+            <div className="max-h-48 overflow-auto text-xs font-mono">
+              {tspHintLines.map((h, i) => (
+                <div key={i} className="flex justify-between py-0.5">
+                  <span>{h.from} → {h.to}</span>
+                  <span>{h.label}</span>
+                </div>
+              ))}
+              {tspHintLines.length === 0 && <div className="text-slate-400">All visited — close tour by returning to S.</div>}
+            </div>
+          </div>
+        )}
+
+        {/* Leg list for all non-SP modes */}
+        {legList.length > 0 && round.gameMode !== "tsp" && (
           <div className="mt-4 rounded-xl bg-white/5 p-3">
             <div className="text-xs font-semibold mb-2">Leg distances</div>
             <div className="max-h-48 overflow-auto text-xs">
@@ -1059,6 +1157,7 @@ function PlayCard({ me, round, onRoundUpdate }) {
 
 
 
+
 function ObjectiveLegend({ objective }) {
   const desc = { time: "Edge labels show minutes.", cost: "Edge labels show $ cost.", co2: "Edge labels show kg CO₂." }[objective];
   return (<div className="text-sm">{desc} Choose the lowest total.</div>);
@@ -1067,7 +1166,7 @@ function ObjectiveLegend({ objective }) {
 // -----------------------------
 // Map (SVG)
 // -----------------------------
-function SvgMap({ scenario, path = [], onClickNode, readonly }) {
+function SvgMap({ scenario, path = [], onClickNode, readonly, hintLines = [] }) {
   const { nodes, edges = [] } = scenario;
 
   // Auto-fit
@@ -1097,10 +1196,11 @@ function SvgMap({ scenario, path = [], onClickNode, readonly }) {
       {/* base edges if present (SP) */}
       {edges.map(([u, v, w, m], idx) => {
         const a = nodeById[u], b = nodeById[v];
+        if (!a || !b) return null;
         const sel = selected.has(u + ">" + v);
         const showVal = typeof w === "number" ? w : (w?.[scenario.objective] ?? w?.time ?? 0);
         return (
-          <g key={idx}>
+          <g key={`e${idx}`}>
             <line x1={a.x} y1={a.y} x2={b.x} y2={b.y}
                   stroke={sel ? "#34d399" : "#94a3b8"} strokeWidth={sel ? 6 : 3} strokeOpacity={0.9} />
             <EdgeLabel a={a} b={b} text={`${m || ""} ${showVal}`} />
@@ -1108,7 +1208,7 @@ function SvgMap({ scenario, path = [], onClickNode, readonly }) {
         );
       })}
 
-      {/* player's polyline (TSP/VRP/Picking) */}
+      {/* TSP/Picking/VRP: player's current path */}
       {path.length > 1 && (
         <polyline
           points={path.map(id => `${nodeById[id]?.x},${nodeById[id]?.y}`).join(" ")}
@@ -1116,7 +1216,20 @@ function SvgMap({ scenario, path = [], onClickNode, readonly }) {
         />
       )}
 
-      {/* nodes + (VRP) demand badges */}
+      {/* TSP hint lines: dashed with distance labels */}
+      {hintLines.map((h, i) => {
+        const a = nodeById[h.from], b = nodeById[h.to];
+        if (!a || !b) return null;
+        return (
+          <g key={`hint${i}`}>
+            <line x1={a.x} y1={a.y} x2={b.x} y2={b.y}
+                  stroke="#cbd5e1" strokeOpacity="0.7" strokeWidth="2" strokeDasharray="6 6" />
+            <EdgeLabel a={a} b={b} text={String(h.label)} />
+          </g>
+        );
+      })}
+
+      {/* nodes (+ VRP demand badges) */}
       {tnodes.map((n, i) => {
         const demand = scenario.demand?.[n.id];
         return (
@@ -1127,7 +1240,6 @@ function SvgMap({ scenario, path = [], onClickNode, readonly }) {
             <text x={n.x} y={n.y - (i % 2 ? 24 : 20)} textAnchor="middle" className="fill-slate-200"
                   style={{ fontSize: 11 }}>{n.label}</text>
 
-            {/* VRP demand pill for customers (not for depot S) */}
             {typeof demand === "number" && n.id !== "S" && (
               <g>
                 <rect x={n.x + 16} y={n.y - 28} rx={8} ry={8} width={38} height={20} fill="#0b1221" opacity="0.9" />
@@ -1141,6 +1253,7 @@ function SvgMap({ scenario, path = [], onClickNode, readonly }) {
     </svg>
   );
 }
+
 
 
 
@@ -1243,21 +1356,33 @@ function computePathCost(path, edges) {
 }
 
 function useRound(room) {
-  const [round, setRound] = useState(loadRoomRound(room));
+  const [round, setRound] = useState(null);
+
   useEffect(() => {
-    const iv = setInterval(() => {
-      let r = loadRoomRound(room);
+    let alive = true;
+
+    const tick = async () => {
+      const r = await loadRoomRound(room);
+      if (!alive) return;
+
       if (r && r.isOpen && r.endsAt && Date.now() > r.endsAt) {
-        // auto-close when timer ends
-        r = { ...r, isOpen: false };
-        saveRoomRound(room, r);
+        const closed = { ...r, isOpen: false };
+        await saveRoomRound(room, closed); // persist closed state
+        if (alive) setRound(closed);
+      } else {
+        setRound(r);
       }
-      setRound(r);
-    }, 400);
-    return () => clearInterval(iv);
+    };
+
+    // initial fetch + polling
+    tick();
+    const iv = setInterval(tick, 800);
+    return () => { alive = false; clearInterval(iv); };
   }, [room]);
+
   return [round, setRound];
 }
+
 
 function getScenarioFromRound(round) {
   if (!round) return null;
@@ -1280,19 +1405,12 @@ function computeStandings(round) {
   const standings = entries.map((e, i) => ({ ...e, rank: i + 1, points: Math.max(0, 20 - (i + 1)) }));
   return standings;
 }
-function applySeasonPoints(room, round, standings, roster) {
-  const season = loadSeason(room);
-  for (const s of standings) {
-    season.totals[s.name] = (season.totals[s.name] || 0) + s.points;
-  }
-  // add roster members with 0 points if they didn't submit (optional but keeps list complete)
-  for (const name of roster) {
-    const submitted = round.players && round.players[name];
-    if (!submitted && season.totals[name] == null) season.totals[name] = 0;
-  }
-  season.history.push({ roundId: round.id, date: Date.now(), standings });
-  saveSeason(room, season);
+
+async function applySeasonPoints(room, round, standings /* array */) {
+  await dbApplySeasonPoints(room, standings);
 }
+
+
 
 // -----------------------------
 // Custom Network Generator
@@ -1719,4 +1837,141 @@ function computeLegsVrp(path, scenario){
     cur = next;
   }
   return out;
+}
+import { supabase } from "./lib/supabase";
+
+// --- Auth (roster) ---
+async function verifyStudent(room, username, pin) {
+  const { data, error } = await supabase
+    .from("roster")
+    .select("display_name,pin")
+    .eq("room", room)
+    .eq("username", username)
+    .maybeSingle();
+  if (error) throw error;
+  if (!data) return { ok: false, reason: "Not found in roster" };
+  if (String(data.pin) !== String(pin)) return { ok: false, reason: "Wrong PIN" };
+  return { ok: true, displayName: data.display_name || username };
+}
+
+// --- Persistence: round (get/set), submissions, season ---
+async function dbLoadCurrentRound(room) {
+  const { data, error } = await supabase
+    .from("rounds")
+    .select("*")
+    .eq("room", room)
+    .order("started_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  return data ? data.payload : null;
+}
+
+async function dbSaveRound(room, round) {
+  if (!round) {
+    await supabase.from("rounds").delete().eq("room", room);
+    return;
+  }
+  await supabase.from("rounds").upsert({
+    id: round.id,
+    room,
+    game_mode: round.gameMode,
+    payload: round,
+    started_at: new Date(round.startedAt).toISOString(),
+    ends_at: round.endsAt ? new Date(round.endsAt).toISOString() : null,
+    is_open: !!round.isOpen,
+    reveal_board: !!round.revealBoard,
+    scored: !!round.scored,
+  });
+}
+
+async function dbUpsertSubmission(roundId, username, rec) {
+  await supabase.from("submissions").upsert({
+    round_id: roundId,
+    username,
+    cost: rec.cost,
+    time_sec: rec.timeSec,
+    score: rec.score,
+    path: rec.path,
+  });
+}
+
+async function dbApplySeasonPoints(room, standings) {
+  // standings = array of { name, place } sorted by score
+  const rows = standings.map((s) => ({
+    room,
+    username: s.name,
+    points: Math.max(0, 20 - s.place),
+  }));
+  // Upsert by incrementing points
+  for (const r of rows) {
+    const { data } = await supabase
+      .from("season_totals")
+      .select("points")
+      .eq("room", r.room)
+      .eq("username", r.username)
+      .maybeSingle();
+    const newPts = (data?.points || 0) + r.points;
+    await supabase.from("season_totals").upsert({
+      room: r.room,
+      username: r.username,
+      points: newPts,
+    });
+  }
+}
+
+async function dbLoadSeasonTotals(room) {
+  const { data } = await supabase
+    .from("season_totals")
+    .select("*")
+    .eq("room", room)
+    .order("points", { ascending: false });
+  return data || [];
+}
+function LoginGate({ onLogin }) {
+  const [room, setRoom] = useState("SCMA");
+  const [username, setUsername] = useState("");
+  const [pin, setPin] = useState("");
+  const [err, setErr] = useState("");
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setErr("");
+    try {
+      const res = await verifyStudent(room.trim(), username.trim(), pin.trim());
+      if (!res.ok) { setErr(res.reason || "Login failed"); return; }
+      const me = { room: room.trim(), name: username.trim(), display: res.displayName, role: "student", verified: true };
+      localStorage.setItem("scma_me", JSON.stringify(me));
+      onLogin(me);
+    } catch (e2) {
+      setErr(e2.message || "Login error");
+    }
+  };
+
+  return (
+    <div className="max-w-md mx-auto mt-16 p-6 rounded-2xl bg-white/5 ring-1 ring-white/10">
+      <h2 className="text-xl font-bold mb-4">Join Game</h2>
+      <form onSubmit={submit} className="space-y-3">
+        <div>
+          <label className="block text-xs text-slate-300 mb-1">Room</label>
+          <input className="bg-white/10 rounded-xl px-3 py-2 w-full" value={room} onChange={e=>setRoom(e.target.value)} />
+        </div>
+        <div>
+          <label className="block text-xs text-slate-300 mb-1">Username</label>
+          <input className="bg-white/10 rounded-xl px-3 py-2 w-full" value={username} onChange={e=>setUsername(e.target.value)} />
+        </div>
+        <div>
+          <label className="block text-xs text-slate-300 mb-1">PIN</label>
+          <input type="password" className="bg-white/10 rounded-xl px-3 py-2 w-full" value={pin} onChange={e=>setPin(e.target.value)} />
+        </div>
+        {err && <div className="text-rose-400 text-sm">{err}</div>}
+        <button type="submit" className="w-full bg-emerald-600 hover:bg-emerald-500 rounded-xl px-4 py-2.5 font-semibold">
+          Enter
+        </button>
+        <div className="text-xs text-slate-400 mt-2">
+          Instructor keeps the same dashboard + PIN as before. Students must appear in the roster.
+        </div>
+      </form>
+    </div>
+  );
 }
