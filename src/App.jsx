@@ -341,15 +341,23 @@ function Lobby({ onJoin, defaultRoom }) {
 
 function HowToCard() {
   return (
-    <div className="rounded-2xl bg-gradient-to-br from-emerald-800/60 to-teal-900/60 p-6 ring-1 ring-white/10 shadow-xl">
+    <div className="rounded-2xl bg-gradient-to-br from-emerald-800/60 to-teal-900/60 p-6 ring-1 ring-white/10 shadow-xl text-emerald-100">
       <h3 className="text-lg font-bold mb-3">How it works</h3>
-      <ul className="space-y-2 text-sm text-emerald-100">
+      <ul className="space-y-2 text-sm">
         <li>• Instructor opens a round and picks a scenario or generates a custom network.</li>
-        <li>• Countdown is visible; build a valid route to the destination and submit before time runs out.</li>
-        <li>• Round ranking uses in-game score (accuracy + speed).</li>
+        <li>• Countdown is visible; click nodes to build a valid route and submit before time runs out.</li>
+        <li>• Score = <code>1000 × (best ÷ yours) + max(0, 200 − seconds)</code>.</li>
         <li>• Season points = <span className="font-semibold">20 − place</span> (min 0). No submit = 0.</li>
         <li>• Leaderboards: This Round + Season (cumulative).</li>
       </ul>
+      <h4 className="text-sm font-semibold mt-4 mb-1">Game goals</h4>
+      <ul className="space-y-1 text-sm">
+        <li>• <span className="font-semibold">Shortest Path:</span> go from <b>S</b> to <b>T</b> minimizing the chosen metric.</li>
+        <li>• <span className="font-semibold">TSP:</span> start at <b>S</b>, visit every node once, and return to <b>S</b>.</li>
+        <li>• <span className="font-semibold">VRP:</span> serve all customers without exceeding vehicle capacity; return to depot to reload.</li>
+        <li>• <span className="font-semibold">Order Picking:</span> walk the grid to collect all picks and return to the dock.</li>
+      </ul>
+      <p className="mt-3 text-xs">Goal: build the most efficient route as fast as you can to maximize score.</p>
     </div>
   );
 }
@@ -945,10 +953,19 @@ function PlayCard({ me, round, onRoundUpdate }) {
   // Precompute cost for SP path separately to keep hooks top-level
   const spPathCost = useMemo(() => computePathCost(path, graphEdges), [path, graphEdges]);
 
-  // Precompute leg lists (for panels)
-  const legsTsp = useMemo(() => computeLegsEuclid(path, scenario.nodes), [path, scenario.nodes]);
-  const legsPick = useMemo(() => computeLegsManhattan(path, scenario.nodes), [path, scenario.nodes]);
-  const legsVrp  = useMemo(() => computeLegsVrp(path, scenario), [path, scenario]);
+  // Precompute leg lists only for active mode (avoids SP crash)
+  const legsTsp = useMemo(
+    () => (round.gameMode === "tsp" ? computeLegsEuclid(path, scenario.nodes) : []),
+    [round.gameMode, path, scenario.nodes]
+  );
+  const legsPick = useMemo(
+    () => (round.gameMode === "pick" ? computeLegsManhattan(path, scenario.nodes) : []),
+    [round.gameMode, path, scenario.nodes]
+  );
+  const legsVrp = useMemo(
+    () => (round.gameMode === "vrp" ? computeLegsVrp(path, scenario) : []),
+    [round.gameMode, path, scenario]
+  );
 
   // ===== NEW: TSP next-step distance hints =====
   const tspHintLines = useMemo(() => {
@@ -1005,7 +1022,17 @@ function PlayCard({ me, round, onRoundUpdate }) {
     }
     if (round.gameMode === "vrp") {
       if (v === "S") return true;
-      return !path.includes(v);
+      if (path.includes(v)) return false;
+      const demand = scenario.demand || {};
+      const cap = scenario.capacity || 8;
+      let load = 0;
+      for (let i = path.length - 1; i >= 0; i--) {
+        const id = path[i];
+        if (id === "S") break;
+        load += demand[id] ?? 1;
+      }
+      const dem = demand[v] ?? 1;
+      return load + dem <= cap;
     }
     // picking
     if (v === "S") return pickAllVisited(path, scenario);
@@ -1060,6 +1087,7 @@ function PlayCard({ me, round, onRoundUpdate }) {
           <div>
             <h2 className="text-xl font-bold">{scenario.title}</h2>
             <div className="text-xs text-slate-300">Objective: {objectiveText}</div>
+            <div className="text-xs text-slate-300">Score = 1000 × (baseline / your cost) + max(0, 200 − time)</div>
           </div>
           <div className="text-right">
             <div className="text-sm text-slate-300">Time left</div>
@@ -1829,17 +1857,18 @@ function computeLegsVrp(path, scenario){
   const out=[]; let load=0; let cur="S";
   for(let i=1;i<path.length;i++){
     const next = path[i];
-    if(!map[next]) continue;
+    if(!map[cur] || !map[next]) continue;
     const dist = Math.hypot(map[cur].x - map[next].x, map[cur].y - map[next].y);
-    if(next === "S"){ load = 0; cur = "S"; out.push({from:cur, to:"S", dist, loadAfter:load}); continue; }
+    if(next === "S"){
+      out.push({from:cur, to:"S", dist, loadAfter:0});
+      cur = "S"; load = 0; continue;
+    }
     const d = demand[next] ?? 1;
     if(load + d > cap){
-      // would overflow → close route S and start new leg
       const toDepot = Math.hypot(map[cur].x - map["S"].x, map[cur].y - map["S"].y);
       out.push({from:cur, to:"S", dist: toDepot, loadAfter: 0});
       cur = "S"; load = 0;
     }
-    // go to customer
     const go = Math.hypot(map[cur].x - map[next].x, map[cur].y - map[next].y);
     load += d; out.push({from:cur, to:next, dist: go, loadAfter: load});
     cur = next;
