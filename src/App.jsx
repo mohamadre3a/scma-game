@@ -15,7 +15,7 @@ import React, { useMemo, useRef, useState, useEffect } from "react";
  * - For class-scale real-time, we’ll wire Supabase next (drop-in).
  */
 
-const INSTRUCTOR_PIN = "4550";
+const INSTRUCTOR_PIN = "13741374";
 
 // -----------------------------
 // Static Scenarios (you can still use these)
@@ -484,6 +484,11 @@ function InstructorPanel({ room }) {
   setRound(null);
 };
 
+  const onSeasonReset = async () => {
+    await dbResetSeason(room);
+    saveSeason(room, { totals: {}, history: [] });
+  };
+
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -660,6 +665,7 @@ function InstructorPanel({ room }) {
               <button onClick={onReveal} className="bg-indigo-600 hover:bg-indigo-500 rounded-xl px-4 py-2.5 font-semibold">Reveal Leaderboards</button>
               <button onClick={onReset} className="bg-white/10 hover:bg-white/20 rounded-xl px-4 py-2.5 font-semibold">Reset</button>
             </div>
+            <button onClick={onSeasonReset} className="mt-1 text-xs text-slate-500 opacity-40 hover:opacity-100 hover:text-red-400 underline">Reset Season Leaderboard</button>
           </div>
         )}
       </div>
@@ -1934,11 +1940,11 @@ async function dbUpsertSubmission(roundId, username, rec) {
 }
 
 async function dbApplySeasonPoints(room, standings) {
-  // standings = array of { name, place } sorted by score
+  // standings = array of { name, rank } sorted by score
   const rows = standings.map((s) => ({
     room,
     username: s.name,
-    points: Math.max(0, 20 - s.place),
+    points: Math.max(0, 20 - s.rank),
   }));
   // Upsert by incrementing points
   for (const r of rows) {
@@ -1964,6 +1970,10 @@ async function dbLoadSeasonTotals(room) {
     .eq("room", room)
     .order("points", { ascending: false });
   return data || [];
+}
+
+async function dbResetSeason(room) {
+  await supabase.from("season_totals").delete().eq("room", room);
 }
 function LoginGate({ onLogin }) {
   const [room, setRoom] = useState("SCMA");
