@@ -849,10 +849,25 @@ function RoundLeaderboardCard({ room, round }) {
   const entries = Object.entries(round.players || {}).map(([name, r]) => ({ name, ...r }));
   entries.sort((a, b) => b.score - a.score || a.timeSec - b.timeSec);
 
+  const { graphEdges } = useWeightedScenario(s, round);
+  const spOpt = useMemo(() => dijkstra(s.nodes, graphEdges, s.start, s.end), [s, graphEdges]);
+  const tspBase = useMemo(() => tspBaselineCost(s.nodes), [s.nodes]);
+  const vrpBase = useMemo(() => vrpBaselineCost(s), [s]);
+  const pickBase = useMemo(() => pickBaselineCost(s), [s]);
+
+  const opt =
+    round.gameMode === "sp" ? spOpt :
+    round.gameMode === "tsp" ? tspBase :
+    round.gameMode === "vrp" ? vrpBase :
+    pickBase;
+
+  const optScore = Math.round(1000 * (opt.cost / opt.cost)) + 200;
+
   return (
     <div className="rounded-2xl bg-white/5 p-6 ring-1 ring-white/10 shadow-xl lg:col-span-2">
       <h2 className="text-xl font-bold mb-1">This Round — Room {room}</h2>
-      <div className="text-xs text-slate-300 mb-4">Scenario: {s.title}</div>
+      <div className="text-xs text-slate-300">Scenario: {s.title}</div>
+      <div className="text-xs text-slate-300 mb-4">Optimal: {opt.path.join("\u2192")} • Cost {fmt(opt.cost)} • Score {optScore}</div>
       <div className="space-y-2">
         {entries.length === 0 && <div className="text-slate-400">No submissions this round.</div>}
         {entries.map((e, i) => (
@@ -1056,9 +1071,9 @@ function PlayCard({ me, round, onRoundUpdate }) {
   // Baselines for scoring
   const optCost =
     round.gameMode === "sp" ? spOptCost :
-    round.gameMode === "tsp" ? tspBaselineCost(scenario.nodes) :
-    round.gameMode === "vrp" ? vrpBaselineCost(scenario) :
-    pickBaselineCost(scenario);
+    round.gameMode === "tsp" ? tspBaselineCost(scenario.nodes).cost :
+    round.gameMode === "vrp" ? vrpBaselineCost(scenario).cost :
+    pickBaselineCost(scenario).cost;
 
   const onSubmit = async () => {
   if (!canSubmit || submitted) return;
@@ -1749,7 +1764,7 @@ function tspBaselineCost(nodes){
       }
     }
   }
-  return tspTourCost(ids, nodes);
+  return { cost: tspTourCost(ids, nodes), path: ids };
 }
 
 // ====== VRP helpers (Euclidean, auto-split by capacity)
@@ -1788,7 +1803,8 @@ function vrpBaselineCost(scenario){
   })).sort((a,b)=>a.ang-b.ang);
   let seq=["S"];
   for (const c of cust) seq.push(c.id);
-  return vrpRouteCostFromSequence(seq, scenario);
+  const cost = vrpRouteCostFromSequence(seq, scenario);
+  return { cost, path: seq };
 }
 
 // ====== Picking helpers (Manhattan TSP on selected picks)
@@ -1839,7 +1855,7 @@ function pickBaselineCost(scenario){
       }
     }
   }
-  return pickTourCost(ids, scenario);
+  return { cost: pickTourCost(ids, scenario), path: ids };
 }
 
 function computeLegsEuclid(path, nodes){
