@@ -1959,10 +1959,13 @@ function computeLegsVrp(path, scenario){
   }
   return out;
 }
-import { supabase } from "./lib/supabase";
+import { supabase, hasSupabase } from "./lib/supabase";
 
 // --- Auth (roster) ---
 async function verifyStudent(room, username, pin) {
+  if (!hasSupabase) {
+    return { ok: true, displayName: username };
+  }
   const { data, error } = await supabase
     .from("roster")
     .select("display_name,pin")
@@ -1977,6 +1980,7 @@ async function verifyStudent(room, username, pin) {
 
 // --- Persistence: round (get/set), submissions, season ---
 async function dbLoadCurrentRound(room) {
+  if (!hasSupabase) return null;
   const { data, error } = await supabase
     .from("rounds")
     .select("*")
@@ -1989,6 +1993,7 @@ async function dbLoadCurrentRound(room) {
 }
 
 async function dbSaveRound(room, round) {
+  if (!hasSupabase) return;
   if (!round) {
     await supabase.from("rounds").delete().eq("room", room);
     return;
@@ -2007,6 +2012,7 @@ async function dbSaveRound(room, round) {
 }
 
 async function dbUpsertSubmission(roundId, username, rec) {
+  if (!hasSupabase) return;
   await supabase.from("submissions").upsert({
     round_id: roundId,
     username,
@@ -2018,6 +2024,7 @@ async function dbUpsertSubmission(roundId, username, rec) {
 }
 
 async function dbApplySeasonPoints(room, standings) {
+  if (!hasSupabase) return;
   // standings = array of { name, rank } sorted by score
   const rows = standings.map((s) => ({
     room,
@@ -2042,6 +2049,7 @@ async function dbApplySeasonPoints(room, standings) {
 }
 
 async function dbLoadSeasonTotals(room) {
+  if (!hasSupabase) return [];
   const { data } = await supabase
     .from("season_totals")
     .select("*")
@@ -2051,6 +2059,7 @@ async function dbLoadSeasonTotals(room) {
 }
 
 async function dbLoadRoundHistory(room) {
+  if (!hasSupabase) return [];
   const { data } = await supabase
     .from("rounds")
     .select("*")
@@ -2062,6 +2071,7 @@ async function dbLoadRoundHistory(room) {
 }
 
 async function dbResetSeason(room) {
+  if (!hasSupabase) return;
   await supabase.from("season_totals").delete().eq("room", room);
 }
 function LoginGate({ onLogin }) {
