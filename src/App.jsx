@@ -416,7 +416,7 @@ function InstructorPanel({ room }) {
       saveRoomRound(room, r2);
       setRound(r2);
     }
-  }, [round, room, roster, setRound]);
+  }, [round?.isOpen]);
 
   // Preview scenario (for SP) or generated nodes (for other modes)
   const baseScenario =
@@ -1457,7 +1457,7 @@ function useWeightedScenario(scenario, round) {
       return [u, v, w, mode];
     });
     return applyModifiers({ ...scenario, edges: withW });
-  }, [scenario, round]);
+  }, [scenario, round?.objectiveMode, round?.objA, round?.objB, round?.alpha]);
 
   const opt = useMemo(
     () => dijkstra(scenario.nodes, graphEdges, scenario.start, scenario.end),
