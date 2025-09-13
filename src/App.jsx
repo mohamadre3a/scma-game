@@ -180,11 +180,16 @@ async function saveRoomRound(room, round) {
 }
 
 async function loadSeason(room) {
-  // returns { totals: {name: points}, history: [] } (adapted for your UI)
-  const rows = await dbLoadSeasonTotals(room);
-  const totals = {};
-  for (const r of rows) totals[r.username] = r.points;
-  return { totals, history: [] };
+  try {
+    const rows = await dbLoadSeasonTotals(room);
+    const totals = {};
+    for (const r of rows) totals[r.username] = r.points;
+    const history = await dbLoadRoundHistory(room);
+    return { totals, history };
+  } catch {
+    // ensure season load failures don't blank the page
+    return { totals: {}, history: [] };
+  }
 }
 
 function saveSeason(room, season) { const s = loadStore(); s["season:" + room] = season; saveStore(s); }
@@ -893,6 +898,7 @@ function RoundLeaderboardCard({ room, round }) {
 function SeasonLeaderboardCard({ room, season }) {
   const totals = Object.entries(season.totals || {}).map(([name, pts]) => ({ name, pts }));
   totals.sort((a, b) => b.pts - a.pts || a.name.localeCompare(b.name));
+  const history = season.history || [];
   return (
     <div className="rounded-2xl bg-gradient-to-br from-emerald-800/60 to-teal-900/60 p-6 ring-1 ring-white/10 shadow-xl">
       <h3 className="font-bold mb-2">Season Leaderboard</h3>
@@ -910,7 +916,63 @@ function SeasonLeaderboardCard({ room, season }) {
         ))}
       </div>
       <ExportCsvButtonSeason room={room} />
+      {history.length > 0 && (
+        <div className="mt-6">
+          <h4 className="font-bold mb-2">Round History</h4>
+          <div className="space-y-2 max-h-64 overflow-y-auto">
+            {history.map((r) => (
+              <RoundHistoryItem key={r.id} round={r} />
+            ))}
+          </div>
+        </div>
+      )}
     </div>
+  );
+}
+
+function RoundHistoryItem({ round }) {
+  const s = getScenarioFromRound(round);
+  const { graphEdges } = useWeightedScenario(
+    s || { nodes: [], edges: [], start: "", end: "" },
+    round
+  );
+  const spOpt = useMemo(
+    () => (s ? dijkstra(s.nodes, graphEdges, s.start, s.end) : { cost: 0, path: [] }),
+    [s, graphEdges]
+  );
+  const tspBase = useMemo(() => (s ? tspBaselineCost(s.nodes) : { cost: 0, path: [] }), [s]);
+  const vrpBase = useMemo(() => (s ? vrpBaselineCost(s) : { cost: 0, path: [] }), [s]);
+  const pickBase = useMemo(() => (s ? pickBaselineCost(s) : { cost: 0, path: [] }), [s]);
+  if (!s) return null;
+  const dateStr = new Date(round.startedAt).toLocaleDateString();
+  const entries = Object.entries(round.players || {}).map(([name, r]) => ({ name, ...r }));
+  entries.sort((a, b) => b.score - a.score || a.timeSec - b.timeSec);
+  const opt =
+    round.gameMode === "sp" ? spOpt :
+    round.gameMode === "tsp" ? tspBase :
+    round.gameMode === "vrp" ? vrpBase :
+    pickBase;
+  const optScore = Math.round(1000 * (opt.cost / opt.cost)) + 200;
+
+  return (
+    <details className="rounded-xl bg-white/5">
+      <summary className="cursor-pointer px-4 py-2 flex justify-between text-sm">
+        <span>{dateStr}</span>
+        <span className="text-xs">{round.id}</span>
+      </summary>
+      <div className="px-4 pb-3 text-xs">
+        <div className="text-slate-300 mb-2">
+          Optimal: {opt.path.join("→")} • Cost {fmt(opt.cost)} • Score {optScore}
+        </div>
+        {entries.length === 0 && <div className="text-slate-400">No submissions.</div>}
+        {entries.map((e, i) => (
+          <div key={e.name} className="flex justify-between py-1">
+            <div>{i + 1}. {e.name}</div>
+            <div>{e.score} ({fmt(e.cost)}, {e.timeSec}s)</div>
+          </div>
+        ))}
+      </div>
+    </details>
   );
 }
 
@@ -1986,6 +2048,17 @@ async function dbLoadSeasonTotals(room) {
     .eq("room", room)
     .order("points", { ascending: false });
   return data || [];
+}
+
+async function dbLoadRoundHistory(room) {
+  const { data } = await supabase
+    .from("rounds")
+    .select("*")
+    .eq("room", room)
+    .order("started_at", { ascending: false });
+  return data
+    ? data.map((r) => ({ ...r.payload, id: r.id, startedAt: r.started_at }))
+    : [];
 }
 
 async function dbResetSeason(room) {
