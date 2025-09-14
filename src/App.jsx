@@ -1301,7 +1301,19 @@ function costForPayloadPath(scenario, payload, playerPath) {
     const opt = computeOptimalForPayload(scenario, payload);
     setBest(opt);
     const s = await dbListSubmissions(row.id);
-    setSubs(s || []);
+    if (s && s.length) {
+      setSubs(s);
+    } else {
+      const players = Object.entries(payload.players || {}).map(([username, r]) => ({
+        id: username,
+        username,
+        score: r.score,
+        cost: r.cost,
+        time_sec: r.timeSec,
+        path: r.path,
+      }));
+      setSubs(players);
+    }
   }
 
   return (
@@ -1448,7 +1460,7 @@ function costForPayloadPath(scenario, payload, playerPath) {
                             {subs.map(row => {
                               const name = row.username || row.user || row.name || "Player";
                               const path = Array.isArray(row.path) ? row.path : null;
-                              const cost = row.score ?? (path ? costForPayloadPath(scenario, payload, path) : null);
+                              const cost = row.cost ?? (path ? costForPayloadPath(scenario, payload, path) : null);
                               return (
                                 <li key={row.id}>
                                   <button
