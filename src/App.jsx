@@ -1224,7 +1224,24 @@ function ObjectiveLegend({ objective }) {
 // Map (SVG)
 // -----------------------------
 function SvgMap({ scenario, path = [], onClickNode, readonly, hintLines = [] }) {
-  const { nodes, edges = [] } = scenario;
+  // Guard: invalid or incomplete scenario
+  if (!scenario || !Array.isArray(scenario.nodes)) {
+    console.error('SvgMap: scenario or nodes missing:', scenario);
+    return null;
+  }
+
+  // Sanitize nodes and log any bad entries
+  const rawNodes = scenario.nodes || [];
+  const nodes = rawNodes.filter(n => n && Number.isFinite(n.x) && Number.isFinite(n.y) && n.id);
+  const badNodes = rawNodes.filter(n => !(n && Number.isFinite(n?.x) && Number.isFinite(n?.y) && n?.id));
+  if (badNodes.length) console.error('SvgMap: bad node entries:', badNodes, 'in scenario:', scenario);
+  if (nodes.length === 0) {
+    console.error('SvgMap: no valid nodes in scenario:', scenario);
+    return null;
+  }
+
+  // Sanitize edges
+  const edges = Array.isArray(scenario.edges) ? scenario.edges : [];
 
   // Auto-fit
   const xs = nodes.map(n => n.x), ys = nodes.map(n => n.y);
@@ -1268,12 +1285,15 @@ function SvgMap({ scenario, path = [], onClickNode, readonly, hintLines = [] }) 
       {/* TSP/Picking/VRP: player's current path */}
       {path.length > 1 && (
         <polyline
-          points={path.map(id => `${nodeById[id]?.x},${nodeById[id]?.y}`).join(" ")}
+          points={path.map(id => {
+            const n = nodeById[id];
+            return n ? `${n.x},${n.y}` : null;
+          }).filter(Boolean).join(" ")}
           fill="none" stroke="#34d399" strokeWidth="6" strokeOpacity="0.7"
         />
       )}
 
-      {/* TSP hint lines: dashed with distance labels */}
+      {/* TSP hint lines */}
       {hintLines.map((h, i) => {
         const a = nodeById[h.from], b = nodeById[h.to];
         if (!a || !b) return null;
@@ -1310,6 +1330,7 @@ function SvgMap({ scenario, path = [], onClickNode, readonly, hintLines = [] }) 
     </svg>
   );
 }
+
 
 
 
@@ -1390,6 +1411,7 @@ function effectiveWeight(scenario, edge, round) {
 
 function useWeightedScenario(scenario, round) {
   const graphEdges = useMemo(() => {
+    if (!scenario?.edges?.length) return [];
     const withW = scenario.edges.map(([u, v, meta, mode]) => {
       const w = effectiveWeight(scenario, [u, v, meta, mode], round);
       return [u, v, w, mode];
@@ -1397,12 +1419,14 @@ function useWeightedScenario(scenario, round) {
     return applyModifiers({ ...scenario, edges: withW });
   }, [scenario, round?.objectiveMode, round?.objA, round?.objB, round?.alpha]);
 
-  const opt = useMemo(
-    () => dijkstra(scenario.nodes, graphEdges, scenario.start, scenario.end),
-    [scenario, graphEdges]
-  );
+  const opt = useMemo(() => {
+    if (!scenario?.nodes?.length) return { cost: Infinity, path: [] };
+    return dijkstra(scenario.nodes, graphEdges, scenario.start, scenario.end);
+  }, [scenario, graphEdges]);
+
   return { graphEdges, optCost: opt.cost };
 }
+
 
 
 function computePathCost(path, edges) {
@@ -1443,9 +1467,11 @@ function useRound(room) {
 
 function getScenarioFromRound(round) {
   if (!round) return null;
-  if (round.customScenario) return round.customScenario;
-  return scenarios.find((x) => x.id === round.scenarioId);
+  if (round.customScenario?.nodes?.length) return round.customScenario;
+  const s = scenarios.find((x) => x.id === round.scenarioId);
+  return s ?? null;
 }
+
 
 function csvEscape(x) { return `"${String(x).replaceAll('"','""')}"`; }
 
