@@ -1163,13 +1163,19 @@ function RoundLeaderboardCard({ room, round }) {
 }, [round.gameMode, s, graphEdges]);
 
 
-  const optScore = Math.round(1000 * (opt.cost / opt.cost)) + 200;
+  const objLabel = round.objectiveMode === "dual"
+  ? `${Math.round(100 * (round.alpha ?? 0.5))}% ${round.objA} + ${Math.round(100 * (1 - (round.alpha ?? 0.5)))}% ${round.objB}`
+  : (round.objA || s.objective || "time");
+
 
   return (
     <div className="rounded-2xl bg-white/5 p-6 ring-1 ring-white/10 shadow-xl lg:col-span-2">
       <h2 className="text-xl font-bold mb-1">This Round — Room {room}</h2>
       <div className="text-xs text-slate-300">Scenario: {s.title}</div>
-      <div className="text-xs text-slate-300 mb-4">Optimal: {opt.path.join("\u2192")} • Cost {fmt(opt.cost)} • Score {optScore}</div>
+      <div className="text-xs text-slate-300 mb-4">
+  Optimal: {opt.path.join("→")} • {objLabel}: {fmt(opt.cost)}
+</div>
+
       <div className="space-y-2">
         {entries.length === 0 && <div className="text-slate-400">No submissions this round.</div>}
         {entries.map((e, i) => (
@@ -1334,6 +1340,10 @@ function costForPayloadPath(scenario, payload, playerPath) {
                   const payload = sel?.payload || {};
                   const scenario = scenarioFromPayload(payload);
                   if (!scenario?.nodes?.length) return <div className="opacity-70">Scenario unavailable.</div>;
+                  
+                  const objLabel = payload?.objectiveMode === "dual"
+                  ? `${Math.round(100 * (payload?.alpha ?? 0.5))}% ${payload?.objA} + ${Math.round(100 * (1 - (payload?.alpha ?? 0.5)))}% ${payload?.objB}`
+                  : (payload?.objA || "time");
 
                   const optimalScore = Number.isFinite(best.cost) ? best.cost.toFixed(2) : "—";
 
@@ -1343,12 +1353,16 @@ function costForPayloadPath(scenario, payload, playerPath) {
                         <div className="font-semibold">Round {sel.id}</div>
                         <div className="text-xs opacity-80">{new Date(sel.started_at || sel.created_at).toLocaleString()}</div>
                         <div className="text-xs mt-1">Game mode: <span className="font-mono">{payload?.gameMode || "sp"}</span></div>
-                        <div className="text-sm mt-1">Optimal score: <span className="font-mono">{optimalScore}</span></div>
+                        <div className="text-sm mt-1">
+                          Optimal ({objLabel}): <span className="font-mono">{optimalScore}</span>
+                        </div>
+
                       </div>
 
                       <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
                         <div className="lg:col-span-2 rounded-lg overflow-hidden border border-emerald-300/20">
-                          <SvgMap scenario={scenario} path={selPlayer?.path || []} optPath={best.path} readonly />
+                          <SvgMap scenario={scenario} round={payload} path={selPlayer?.path || []} optPath={best.path} readonly />
+
                         </div>
                         <div className="rounded-lg border border-emerald-300/20 p[2px] p-2">
                           <div className="font-semibold mb-2">Players</div>
@@ -1615,10 +1629,12 @@ const r = (await loadRoomRound(round.room || "SCMA")) || round;
         <div className="overflow-hidden rounded-xl bg-black/20 border border-white/10">
           <SvgMap
             scenario={scenario}
+            round={round}               // ← NEW: use the selected objective / α for labels
             path={path}
             onClickNode={onClickNode}
             hintLines={round.gameMode === "tsp" ? tspHintLines : []}
           />
+
         </div>
 
         {/* Numbers & legs */}
@@ -1716,7 +1732,7 @@ function ObjectiveLegend({ objective }) {
 // -----------------------------
 // Map (SVG)
 // -----------------------------
-function SvgMap({ scenario, path = [], optPath = [], onClickNode, readonly, hintLines = [] }) {
+function SvgMap({ scenario, round = null, path = [], optPath = [], onClickNode, readonly, hintLines = [] }) {
 
   // Guard: invalid or incomplete scenario
   if (!scenario || !Array.isArray(scenario.nodes)) {
@@ -1734,8 +1750,12 @@ function SvgMap({ scenario, path = [], optPath = [], onClickNode, readonly, hint
     return null;
   }
 
-  // Sanitize edges
-  const edges = Array.isArray(scenario.edges) ? scenario.edges : [];
+  // Edges for display:
+  // - If we have a round (or round-like payload), build weighted edges using the selected objective / α and modifiers.
+  // - Otherwise fall back to raw scenario edges (used in simple previews).
+  const edges = Array.isArray(scenario.edges) ? (
+    round ? buildGraphEdges(scenario, round) : scenario.edges
+  ) : [];
 
   // Auto-fit
   const xs = nodes.map(n => n.x), ys = nodes.map(n => n.y);
@@ -1761,12 +1781,14 @@ function SvgMap({ scenario, path = [], optPath = [], onClickNode, readonly, hint
 
   return (
     <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-[640px]">
-      {/* base edges if present (SP) */}
+      {/* base edges (SP) */}
       {edges.map(([u, v, w, m], idx) => {
         const a = nodeById[u], b = nodeById[v];
         if (!a || !b) return null;
         const sel = selected.has(u + ">" + v);
-        const showVal = typeof w === "number" ? w : (w?.[scenario.objective] ?? w?.time ?? 0);
+        // When edges are weighted for the round, w is numeric already (effective weight after α + modifiers).
+        // If no round was provided (simple preview), edge meta may be an object → show scenario.objective/time as a fallback.
+        const showVal = (typeof w === "number") ? w : (w?.[scenario.objective] ?? w?.time ?? 0);
         return (
           <g key={`e${idx}`}>
             <line x1={a.x} y1={a.y} x2={b.x} y2={b.y}
@@ -1791,7 +1813,6 @@ function SvgMap({ scenario, path = [], optPath = [], onClickNode, readonly, hint
         />
       )}
 
-
       {/* TSP/Picking/VRP: player's current path */}
       {path.length > 1 && (
         <polyline
@@ -1799,13 +1820,16 @@ function SvgMap({ scenario, path = [], optPath = [], onClickNode, readonly, hint
             const n = nodeById[id];
             return n ? `${n.x},${n.y}` : null;
           }).filter(Boolean).join(" ")}
-          fill="none" stroke="#34d399" strokeWidth="6" strokeOpacity="0.7"
+          fill="none"
+          stroke="#60a5fa"
+          strokeWidth="4"
+          strokeOpacity="0.9"
         />
       )}
 
-      {/* TSP hint lines */}
-      {hintLines.map((h, i) => {
-        const a = nodeById[h.from], b = nodeById[h.to];
+      {/* hint lines (e.g., TSP next-step distances) */}
+      {Array.isArray(hintLines) && hintLines.map((h, i) => {
+        const a = nodeById[h.u], b = nodeById[h.v];
         if (!a || !b) return null;
         return (
           <g key={`hint${i}`}>
@@ -1820,18 +1844,13 @@ function SvgMap({ scenario, path = [], optPath = [], onClickNode, readonly, hint
       {tnodes.map((n, i) => {
         const demand = scenario.demand?.[n.id];
         return (
-          <g key={n.id} onClick={() => !readonly && onClickNode?.(n.id)} className={readonly ? "" : "cursor-pointer"}>
-            <circle cx={n.x} cy={n.y} r={15} fill="#0ea5e9" stroke="#bae6fd" strokeWidth={3} />
-            <text x={n.x} y={n.y + (i % 2 ? 34 : 30)} textAnchor="middle" className="fill-white"
-                  style={{ fontSize: 12, fontWeight: 700 }}>{n.id}</text>
-            <text x={n.x} y={n.y - (i % 2 ? 24 : 20)} textAnchor="middle" className="fill-slate-200"
-                  style={{ fontSize: 11 }}>{n.label}</text>
-
-            {typeof demand === "number" && n.id !== "S" && (
+          <g key={n.id} onClick={() => !readonly && onClickNode?.(n.id)} className="cursor-pointer">
+            <circle cx={n.x} cy={n.y} r={12} fill={n.id === "S" ? "#16a34a" : n.id === "T" ? "#ef4444" : "#38bdf8"} stroke="#0ea5e9" strokeWidth="2" />
+            <text x={n.x} y={n.y + 4} textAnchor="middle" fontWeight="bold" fontSize="12" fill="white">{n.label || n.id}</text>
+            {Number.isFinite(demand) && (
               <g>
-                <rect x={n.x + 16} y={n.y - 28} rx={8} ry={8} width={38} height={20} fill="#0b1221" opacity="0.9" />
-                <text x={n.x + 35} y={n.y - 14} textAnchor="middle" className="fill-white"
-                      style={{ fontSize: 11, fontWeight: 700 }}>d:{demand}</text>
+                <rect x={n.x + 14} y={n.y - 20} rx="4" ry="4" width="28" height="16" fill="#083344" stroke="#06b6d4" strokeWidth="1" />
+                <text x={n.x + 28} y={n.y - 8} textAnchor="middle" fontSize="10" fill="#67e8f9">{demand}</text>
               </g>
             )}
           </g>
@@ -1840,6 +1859,7 @@ function SvgMap({ scenario, path = [], optPath = [], onClickNode, readonly, hint
     </svg>
   );
 }
+
 
 
 
