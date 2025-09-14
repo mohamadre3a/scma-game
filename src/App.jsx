@@ -849,17 +849,23 @@ function RoundLeaderboardCard({ room, round }) {
   const entries = Object.entries(round.players || {}).map(([name, r]) => ({ name, ...r }));
   entries.sort((a, b) => b.score - a.score || a.timeSec - b.timeSec);
 
-  const { graphEdges } = useWeightedScenario(s, round);
-  const spOpt = useMemo(() => dijkstra(s.nodes, graphEdges, s.start, s.end), [s, graphEdges]);
-  const tspBase = useMemo(() => tspBaselineCost(s.nodes), [s.nodes]);
-  const vrpBase = useMemo(() => vrpBaselineCost(s), [s]);
-  const pickBase = useMemo(() => pickBaselineCost(s), [s]);
+    const { graphEdges } = useWeightedScenario(s, round);
 
-  const opt =
-    round.gameMode === "sp" ? spOpt :
-    round.gameMode === "tsp" ? tspBase :
-    round.gameMode === "vrp" ? vrpBase :
-    pickBase;
+  const opt = useMemo(() => {
+    if (!s?.nodes?.length) return { cost: Infinity, path: [] };
+    switch (round.gameMode) {
+      case "sp":
+        return dijkstra(s.nodes, graphEdges, s.start, s.end);
+      case "tsp":
+        return tspBaselineCost(s.nodes);
+      case "vrp":
+        return vrpBaselineCost(s);
+      case "pick":
+      default:
+        return pickBaselineCost(s);
+    }
+  }, [round.gameMode, s, graphEdges]);
+
 
   const optScore = Math.round(1000 * (opt.cost / opt.cost)) + 200;
 
@@ -1734,21 +1740,31 @@ function Footer() { return (<div className="mt-8 text-center text-xs text-slate-
 
 
 // ===== Distance helpers
+
 function euclid(a, b) {
-  // Defensive checks to avoid "cannot read property 'x' of undefined"
-  if (!a || !b) {
-    console.error("euclid: missing node", { a, b });
-    return Infinity; // treat as very large distance so algorithms avoid using it
-  }
-  const ax = Number(a.x), ay = Number(a.y), bx = Number(b.x), by = Number(b.y);
-  if (!Number.isFinite(ax) || !Number.isFinite(ay) || !Number.isFinite(bx) || !Number.isFinite(by)) {
-    console.error("euclid: invalid coordinates on node(s)", { a, b });
+  if (
+    !a || !b ||
+    !Number.isFinite(a.x) || !Number.isFinite(a.y) ||
+    !Number.isFinite(b.x) || !Number.isFinite(b.y)
+  ) {
+    console.error("euclid: invalid inputs", { a, b });
     return Infinity;
   }
-  return Math.hypot(ax - bx, ay - by);
+  return Math.hypot(a.x - b.x, a.y - b.y);
 }
 
-function manhattan(a,b){ return Math.abs(a.x-b.x)+Math.abs(a.y-b.y); }
+function manhattan(a, b) {
+  if (
+    !a || !b ||
+    !Number.isFinite(a.x) || !Number.isFinite(a.y) ||
+    !Number.isFinite(b.x) || !Number.isFinite(b.y)
+  ) {
+    console.error("manhattan: invalid inputs", { a, b });
+    return Infinity;
+  }
+  return Math.abs(a.x - b.x) + Math.abs(a.y - b.y);
+}
+
 function nodeByIdMap(nodes){ return Object.fromEntries(nodes.map(n=>[n.id,n])); }
 
 // ====== TSP helpers (Euclidean)
@@ -1774,86 +1790,60 @@ function tspTourCost(path, nodes, allowPartial=false){
 }
 // Baseline: NN + 2-opt
 function tspBaselineCost(nodes) {
-  // Validate input
   if (!Array.isArray(nodes) || nodes.length === 0) {
     console.error("tspBaselineCost: invalid nodes argument", nodes);
     return { cost: Infinity, path: [] };
   }
 
-  // Filter out malformed entries and log them
   const bad = nodes.filter(n => !(n && typeof n.id === "string" && Number.isFinite(n.x) && Number.isFinite(n.y)));
-  if (bad.length) {
-    console.error("tspBaselineCost: found malformed node entries, ignoring them:", bad);
-  }
-  const clean = nodes.filter(n => n && typeof n.id === "string" && Number.isFinite(n.x) && Number.isFinite(n.y));
+  if (bad.length) console.error("tspBaselineCost: malformed node entries:", bad);
 
-  // Must have some nodes after cleaning
-  if (clean.length === 0) {
-    console.error("tspBaselineCost: no valid nodes after cleaning", nodes);
+  const clean = nodes.filter(n => n && typeof n.id === "string" && Number.isFinite(n.x) && Number.isFinite(n.y));
+  const map = nodeByIdMap(clean);
+
+  if (!map["S"]) {
+    console.error("tspBaselineCost: missing depot node 'S' in nodes:", clean);
     return { cost: Infinity, path: [] };
   }
 
-  // Need depot 'S'
-  const map = Object.fromEntries(clean.map(n => [n.id, n]));
-  if (!map["S"]) {
-    console.error("tspBaselineCost: missing depot node 'S' in nodes:", clean);
-    // fallback: return ids in their order (safe, non-crashing)
-    const fallback = clean.map(n => n.id);
-    return { cost: Infinity, path: fallback.length ? ["S", ...fallback, "S"] : [] };
-  }
-
-  // helper: euclidean distance
-  const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
-
-  // Simple nearest-neighbor tour starting at S, then 2-opt
-  const customers = clean.filter(n => n.id !== "S").map(n => n.id);
-  let unvisited = new Set(customers);
-  let tour = ["S"];
-  let cur = "S";
-
-  while (unvisited.size) {
-    let best = null, bestd = Infinity;
-    for (const id of unvisited) {
-      const d = dist(map[cur], map[id]);
-      if (d < bestd) { bestd = d; best = id; }
+  // Nearest-neighbour from S
+  let un = new Set(clean.filter(n => n.id !== "S").map(n => n.id));
+  let tour = ["S"], cur = "S";
+  while (un.size) {
+    let bestId = null, bestd = Infinity;
+    for (const id of un) {
+      const d = euclid(map[cur], map[id]);
+      if (d < bestd) { bestd = d; bestId = id; }
     }
-    if (!best) break;
-    tour.push(best);
-    unvisited.delete(best);
-    cur = best;
+    if (!bestId) break;
+    tour.push(bestId);
+    un.delete(bestId);
+    cur = bestId;
   }
   tour.push("S");
 
-  // 2-opt (improve)
-  const twoOpt = (arr) => {
-    const getCost = (a, b) => dist(map[a], map[b]);
-    let improved = true;
-    while (improved) {
-      improved = false;
-      for (let i = 1; i < arr.length - 2; i++) {
-        for (let k = i + 1; k < arr.length - 1; k++) {
-          const A = arr[i - 1], B = arr[i], C = arr[k], D = arr[k + 1];
-          const delta = (getCost(A, C) + getCost(B, D)) - (getCost(A, B) + getCost(C, D));
-          if (delta < -1e-6) {
-            const rev = arr.slice(i, k + 1).reverse();
-            arr.splice(i, k - i + 1, ...rev);
-            improved = true;
-          }
+  // 2-opt improvement
+  const ids = tour.slice();
+  const coord = id => map[id];
+  let improved = true;
+  while (improved) {
+    improved = false;
+    for (let i = 1; i < ids.length - 2; i++) {
+      for (let k = i + 1; k < ids.length - 1; k++) {
+        const A = ids[i - 1], B = ids[i], C = ids[k], D = ids[k + 1];
+        const delta = (euclid(coord(A), coord(C)) + euclid(coord(B), coord(D)))
+                    - (euclid(coord(A), coord(B)) + euclid(coord(C), coord(D)));
+        if (delta < -1e-6) {
+          ids.splice(i, k - i + 1, ...ids.slice(i, k + 1).reverse());
+          improved = true;
         }
       }
     }
-    return arr;
-  };
-
-  const finalTour = twoOpt(tour.slice());
-  // compute cost
-  let total = 0;
-  for (let i = 0; i < finalTour.length - 1; i++) {
-    total += dist(map[finalTour[i]], map[finalTour[i + 1]]);
   }
 
-  return { cost: total, path: finalTour };
+  return { cost: tspTourCost(ids, clean), path: ids };
 }
+
 
 
 // ====== VRP helpers (Euclidean, auto-split by capacity)
@@ -1884,75 +1874,29 @@ function vrpRouteCostFromSequence(seq, scenario){
   return cost;
 }
 // vrpBaselineCost - robust version (greedy heuristic)
-function vrpBaselineCost(nodes, demand = {}, vehicleCapacity = 100) {
-  if (!Array.isArray(nodes) || nodes.length === 0) {
-    console.error("vrpBaselineCost: invalid nodes argument", nodes);
-    return { cost: Infinity, routes: [] };
+function vrpBaselineCost(scenario) {
+  if (!scenario || !Array.isArray(scenario.nodes)) {
+    console.error("vrpBaselineCost: invalid scenario", scenario);
+    return { cost: Infinity, path: [] };
   }
 
-  // Filter and log malformed nodes
-  const bad = nodes.filter(n => !(n && typeof n.id === "string" && Number.isFinite(n.x) && Number.isFinite(n.y)));
-  if (bad.length) {
-    console.error("vrpBaselineCost: found malformed node entries, ignoring them:", bad);
-  }
-  const clean = nodes.filter(n => n && typeof n.id === "string" && Number.isFinite(n.x) && Number.isFinite(n.y));
-
-  if (clean.length === 0) {
-    console.error("vrpBaselineCost: no valid nodes after cleaning", nodes);
-    return { cost: Infinity, routes: [] };
+  const nodes = scenario.nodes.filter(n => n && typeof n.id === "string" && Number.isFinite(n.x) && Number.isFinite(n.y));
+  const depot = nodes.find(n => n.id === "S");
+  if (!depot) {
+    console.error("vrpBaselineCost: missing depot node 'S' in nodes:", nodes);
+    return { cost: Infinity, path: [] };
   }
 
-  const map = Object.fromEntries(clean.map(n => [n.id, n]));
+  const cust = nodes
+    .filter(n => n.id !== "S")
+    .map(n => ({ id: n.id, ang: Math.atan2(n.y - depot.y, n.x - depot.x) }))
+    .sort((a, b) => a.ang - b.ang);
 
-  if (!map["S"]) {
-    console.error("vrpBaselineCost: missing depot node 'S' in nodes:", clean);
-    return { cost: Infinity, routes: [] };
-  }
-
-  // Build customer list excluding 'S'
-  const customers = clean.filter(n => n.id !== "S").map(n => ({ id: n.id, demand: Number(demand?.[n.id] ?? 0) }));
-
-  // distance helper
-  const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
-
-  // Greedy: fill vehicles until capacity exhausted
-  const routes = [];
-  let remaining = [...customers].sort((a,b)=>b.demand - a.demand); // largest first
-  while (remaining.length) {
-    let load = 0;
-    let route = ["S"];
-    // pick customers until capacity
-    for (let i = 0; i < remaining.length; ) {
-      if (load + remaining[i].demand <= vehicleCapacity) {
-        load += remaining[i].demand;
-        route.push(remaining[i].id);
-        remaining.splice(i, 1);
-      } else {
-        i++;
-      }
-    }
-    route.push("S");
-    routes.push(route);
-    // safety to avoid infinite loop
-    const maxIter = 1000;
-    if (routes.length > maxIter) break;
-  }
-
-  // compute cost of routes
-  let cost = 0;
-  for (const r of routes) {
-    for (let i = 0; i < r.length - 1; i++) {
-      const A = map[r[i]], B = map[r[i+1]];
-      if (!A || !B) {
-        console.error("vrpBaselineCost: missing node in route computation", r[i], r[i+1], map);
-        return { cost: Infinity, routes };
-      }
-      cost += dist(A, B);
-    }
-  }
-
-  return { cost, routes };
+  const seq = ["S", ...cust.map(c => c.id), "S"];
+  const cost = vrpRouteCostFromSequence(seq, { ...scenario, nodes });
+  return { cost, path: seq };
 }
+
 
 
 // ====== Picking helpers (Manhattan TSP on selected picks)
@@ -1973,38 +1917,57 @@ function pickTourCost(path, scenario, allowPartial=false){
   }
   return cost;
 }
-function pickBaselineCost(scenario){
-  // NN + 2-opt with Manhattan
-  const nodes = scenario.nodes;
+function pickBaselineCost(scenario) {
+  if (!scenario || !Array.isArray(scenario.nodes)) {
+    console.error("pickBaselineCost: invalid scenario", scenario);
+    return { cost: Infinity, path: [] };
+  }
+
+  const nodes = scenario.nodes.filter(n => n && typeof n.id === "string" && Number.isFinite(n.x) && Number.isFinite(n.y));
   const map = nodeByIdMap(nodes);
-  const n = nodes.filter(nd=>nd.id!=="S");
-  let un = new Set(n.map(x=>x.id));
-  let tour=["S"], cur="S";
-  while(un.size){
-    let best=null,bd=Infinity;
-    for (const id of un){
+  if (!map["S"]) {
+    console.error("pickBaselineCost: missing depot node 'S' in nodes:", nodes);
+    return { cost: Infinity, path: [] };
+  }
+
+  // NN
+  const n = nodes.filter(nd => nd.id !== "S");
+  let un = new Set(n.map(x => x.id));
+  let tour = ["S"], cur = "S";
+  while (un.size) {
+    let best = null, bd = Infinity;
+    for (const id of un) {
       const d = manhattan(map[cur], map[id]);
-      if (d<bd){bd=d;best=id;}
+      if (d < bd) { bd = d; best = id; }
     }
-    tour.push(best); un.delete(best); cur=best;
+    if (!best) break;
+    tour.push(best);
+    un.delete(best);
+    cur = best;
   }
   tour.push("S");
+
   // 2-opt (Manhattan)
   const ids = tour.slice();
-  const dist = (A,B)=>manhattan(map[A],map[B]);
-  let improved=true;
-  while(improved){
-    improved=false;
-    for(let i=1;i<ids.length-2;i++){
-      for(let k=i+1;k<ids.length-1;k++){
-        const A=ids[i-1], B=ids[i], C=ids[k], D=ids[k+1];
-        const delta = (dist(A,C)+dist(B,D)) - (dist(A,B)+dist(C,D));
-        if (delta < -1e-6){ ids.splice(i,k-i+1,...ids.slice(i,k+1).reverse()); improved=true; }
+  let improved = true;
+  while (improved) {
+    improved = false;
+    for (let i = 1; i < ids.length - 2; i++) {
+      for (let k = i + 1; k < ids.length - 1; k++) {
+        const A = ids[i - 1], B = ids[i], C = ids[k], D = ids[k + 1];
+        const delta = (manhattan(map[A], map[C]) + manhattan(map[B], map[D]))
+                    - (manhattan(map[A], map[B]) + manhattan(map[C], map[D]));
+        if (delta < -1e-6) {
+          ids.splice(i, k - i + 1, ...ids.slice(i, k + 1).reverse());
+          improved = true;
+        }
       }
     }
   }
-  return { cost: pickTourCost(ids, scenario), path: ids };
+
+  return { cost: pickTourCost(ids, { nodes }), path: ids };
 }
+
 
 function computeLegsEuclid(path, nodes){
   const map = Object.fromEntries(nodes.map(n=>[n.id,n]));
