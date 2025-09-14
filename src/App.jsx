@@ -1734,7 +1734,20 @@ function Footer() { return (<div className="mt-8 text-center text-xs text-slate-
 
 
 // ===== Distance helpers
-function euclid(a,b){ return Math.hypot(a.x-b.x, a.y-b.y); }
+function euclid(a, b) {
+  // Defensive checks to avoid "cannot read property 'x' of undefined"
+  if (!a || !b) {
+    console.error("euclid: missing node", { a, b });
+    return Infinity; // treat as very large distance so algorithms avoid using it
+  }
+  const ax = Number(a.x), ay = Number(a.y), bx = Number(b.x), by = Number(b.y);
+  if (!Number.isFinite(ax) || !Number.isFinite(ay) || !Number.isFinite(bx) || !Number.isFinite(by)) {
+    console.error("euclid: invalid coordinates on node(s)", { a, b });
+    return Infinity;
+  }
+  return Math.hypot(ax - bx, ay - by);
+}
+
 function manhattan(a,b){ return Math.abs(a.x-b.x)+Math.abs(a.y-b.y); }
 function nodeByIdMap(nodes){ return Object.fromEntries(nodes.map(n=>[n.id,n])); }
 
@@ -1760,38 +1773,88 @@ function tspTourCost(path, nodes, allowPartial=false){
   return cost;
 }
 // Baseline: NN + 2-opt
-function tspBaselineCost(nodes){
-  const n = nodes.filter(n=>n.id!=="S");
-  const map = nodeByIdMap(nodes);
-  // nearest neighbor
-  let un = new Set(n.map(x=>x.id));
+function tspBaselineCost(nodes) {
+  // Validate input
+  if (!Array.isArray(nodes) || nodes.length === 0) {
+    console.error("tspBaselineCost: invalid nodes argument", nodes);
+    return { cost: Infinity, path: [] };
+  }
+
+  // Filter out malformed entries and log them
+  const bad = nodes.filter(n => !(n && typeof n.id === "string" && Number.isFinite(n.x) && Number.isFinite(n.y)));
+  if (bad.length) {
+    console.error("tspBaselineCost: found malformed node entries, ignoring them:", bad);
+  }
+  const clean = nodes.filter(n => n && typeof n.id === "string" && Number.isFinite(n.x) && Number.isFinite(n.y));
+
+  // Must have some nodes after cleaning
+  if (clean.length === 0) {
+    console.error("tspBaselineCost: no valid nodes after cleaning", nodes);
+    return { cost: Infinity, path: [] };
+  }
+
+  // Need depot 'S'
+  const map = Object.fromEntries(clean.map(n => [n.id, n]));
+  if (!map["S"]) {
+    console.error("tspBaselineCost: missing depot node 'S' in nodes:", clean);
+    // fallback: return ids in their order (safe, non-crashing)
+    const fallback = clean.map(n => n.id);
+    return { cost: Infinity, path: fallback.length ? ["S", ...fallback, "S"] : [] };
+  }
+
+  // helper: euclidean distance
+  const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+  // Simple nearest-neighbor tour starting at S, then 2-opt
+  const customers = clean.filter(n => n.id !== "S").map(n => n.id);
+  let unvisited = new Set(customers);
   let tour = ["S"];
   let cur = "S";
-  while (un.size){
-    let best=null,bd=Infinity;
-    for (const id of un){
-      const d = euclid(map[cur], map[id]);
-      if (d<bd){bd=d;best=id;}
+
+  while (unvisited.size) {
+    let best = null, bestd = Infinity;
+    for (const id of unvisited) {
+      const d = dist(map[cur], map[id]);
+      if (d < bestd) { bestd = d; best = id; }
     }
-    tour.push(best); un.delete(best); cur=best;
+    if (!best) break;
+    tour.push(best);
+    unvisited.delete(best);
+    cur = best;
   }
   tour.push("S");
-  // 2-opt
-  const ids = tour.slice();
-  const coord = (id)=>map[id];
-  let improved = true;
-  while(improved){
-    improved=false;
-    for(let i=1;i<ids.length-2;i++){
-      for(let k=i+1;k<ids.length-1;k++){
-        const A=ids[i-1], B=ids[i], C=ids[k], D=ids[k+1];
-        const delta = (euclid(coord(A),coord(C))+euclid(coord(B),coord(D))) - (euclid(coord(A),coord(B))+euclid(coord(C),coord(D)));
-        if (delta < -1e-6){ ids.splice(i,k-i+1,...ids.slice(i,k+1).reverse()); improved=true; }
+
+  // 2-opt (improve)
+  const twoOpt = (arr) => {
+    const getCost = (a, b) => dist(map[a], map[b]);
+    let improved = true;
+    while (improved) {
+      improved = false;
+      for (let i = 1; i < arr.length - 2; i++) {
+        for (let k = i + 1; k < arr.length - 1; k++) {
+          const A = arr[i - 1], B = arr[i], C = arr[k], D = arr[k + 1];
+          const delta = (getCost(A, C) + getCost(B, D)) - (getCost(A, B) + getCost(C, D));
+          if (delta < -1e-6) {
+            const rev = arr.slice(i, k + 1).reverse();
+            arr.splice(i, k - i + 1, ...rev);
+            improved = true;
+          }
+        }
       }
     }
+    return arr;
+  };
+
+  const finalTour = twoOpt(tour.slice());
+  // compute cost
+  let total = 0;
+  for (let i = 0; i < finalTour.length - 1; i++) {
+    total += dist(map[finalTour[i]], map[finalTour[i + 1]]);
   }
-  return { cost: tspTourCost(ids, nodes), path: ids };
+
+  return { cost: total, path: finalTour };
 }
+
 
 // ====== VRP helpers (Euclidean, auto-split by capacity)
 function vrpAllCustomersSelected(path, scenario){
@@ -1820,18 +1883,77 @@ function vrpRouteCostFromSequence(seq, scenario){
   if (cur!=="S") cost += euclid(map[cur], map["S"]);
   return cost;
 }
-function vrpBaselineCost(scenario){
-  // Greedy sweep by angle around depot with capacity splitting
-  const depot = scenario.nodes.find(n=>n.id==="S");
-  const cust = scenario.nodes.filter(n=>n.id!=="S").map(n=>({
-    id:n.id,
-    ang: Math.atan2(n.y-depot.y, n.x-depot.x)
-  })).sort((a,b)=>a.ang-b.ang);
-  let seq=["S"];
-  for (const c of cust) seq.push(c.id);
-  const cost = vrpRouteCostFromSequence(seq, scenario);
-  return { cost, path: seq };
+// vrpBaselineCost - robust version (greedy heuristic)
+function vrpBaselineCost(nodes, demand = {}, vehicleCapacity = 100) {
+  if (!Array.isArray(nodes) || nodes.length === 0) {
+    console.error("vrpBaselineCost: invalid nodes argument", nodes);
+    return { cost: Infinity, routes: [] };
+  }
+
+  // Filter and log malformed nodes
+  const bad = nodes.filter(n => !(n && typeof n.id === "string" && Number.isFinite(n.x) && Number.isFinite(n.y)));
+  if (bad.length) {
+    console.error("vrpBaselineCost: found malformed node entries, ignoring them:", bad);
+  }
+  const clean = nodes.filter(n => n && typeof n.id === "string" && Number.isFinite(n.x) && Number.isFinite(n.y));
+
+  if (clean.length === 0) {
+    console.error("vrpBaselineCost: no valid nodes after cleaning", nodes);
+    return { cost: Infinity, routes: [] };
+  }
+
+  const map = Object.fromEntries(clean.map(n => [n.id, n]));
+
+  if (!map["S"]) {
+    console.error("vrpBaselineCost: missing depot node 'S' in nodes:", clean);
+    return { cost: Infinity, routes: [] };
+  }
+
+  // Build customer list excluding 'S'
+  const customers = clean.filter(n => n.id !== "S").map(n => ({ id: n.id, demand: Number(demand?.[n.id] ?? 0) }));
+
+  // distance helper
+  const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+  // Greedy: fill vehicles until capacity exhausted
+  const routes = [];
+  let remaining = [...customers].sort((a,b)=>b.demand - a.demand); // largest first
+  while (remaining.length) {
+    let load = 0;
+    let route = ["S"];
+    // pick customers until capacity
+    for (let i = 0; i < remaining.length; ) {
+      if (load + remaining[i].demand <= vehicleCapacity) {
+        load += remaining[i].demand;
+        route.push(remaining[i].id);
+        remaining.splice(i, 1);
+      } else {
+        i++;
+      }
+    }
+    route.push("S");
+    routes.push(route);
+    // safety to avoid infinite loop
+    const maxIter = 1000;
+    if (routes.length > maxIter) break;
+  }
+
+  // compute cost of routes
+  let cost = 0;
+  for (const r of routes) {
+    for (let i = 0; i < r.length - 1; i++) {
+      const A = map[r[i]], B = map[r[i+1]];
+      if (!A || !B) {
+        console.error("vrpBaselineCost: missing node in route computation", r[i], r[i+1], map);
+        return { cost: Infinity, routes };
+      }
+      cost += dist(A, B);
+    }
+  }
+
+  return { cost, routes };
 }
+
 
 // ====== Picking helpers (Manhattan TSP on selected picks)
 function pickAllVisited(path, scenario){
