@@ -387,7 +387,7 @@ function HowToCard() {
         <li>• Instructor opens a round and picks a scenario or generates a custom network.</li>
         <li>• Countdown is visible; click nodes to build a valid route and submit before time runs out.</li>
         <li>• Score = <code>1000 × (best ÷ yours) + max(0, 200 − seconds)</code>.</li>
-        <li>• Season points = <span className="font-semibold">20 − place</span> (min 0). No submit = 0.</li>
+        <li>• Season points = <span className="font-semibold">24 − place</span> (min 0). No submit = 0.</li>
         <li>• Leaderboards: This Round + Season (cumulative).</li>
       </ul>
       <h4 className="text-sm font-semibold mt-4 mb-1">Game goals</h4>
@@ -1188,7 +1188,7 @@ function RoundLeaderboardCard({ room, round }) {
               </div>
             </div>
             <div className="text-right text-xs">
-              <div>Season points: {Math.max(0, 20 - (i + 1))}</div>
+              <div>Season points: {Math.max(0, 24 - (i + 1))}</div>
             </div>
           </div>
         ))}
@@ -1201,7 +1201,19 @@ function RoundLeaderboardCard({ room, round }) {
 function SeasonLeaderboardCard({ room, season }) {
   // season totals (existing)
   const totals = Object.entries(season.totals || {}).map(([name, pts]) => ({ name, pts }));
+
   totals.sort((a, b) => b.pts - a.pts || a.name.localeCompare(b.name));
+
+  const [selectedPlayer, setSelectedPlayer] = React.useState(null);
+  const [playerHistory, setPlayerHistory] = React.useState([]);
+  useEffect(() => {
+    if (!selectedPlayer) return;
+    (async () => {
+      const rows = await dbListPlayerHistory(room, selectedPlayer, 100);
+      setPlayerHistory(rows);
+    })();
+  }, [room, selectedPlayer]);
+
 
   // --- New: Past rounds state ---
   const [histOpen, setHistOpen] = React.useState(false);
@@ -1211,6 +1223,19 @@ function SeasonLeaderboardCard({ room, season }) {
   const [subs, setSubs] = React.useState([]);            // submissions for selected round
   const [best, setBest] = React.useState({ path: [], cost: Infinity }); // optimal for selected
   const [selPlayer, setSelPlayer] = React.useState(null);// selected player row
+
+  const [playerHist, setPlayerHist] = React.useState([]);
+useEffect(() => {
+  let alive = true;
+  (async () => {
+    if (!selPlayer) { setPlayerHist([]); return; }
+    const rows = await dbListPlayerHistory(room, selPlayer.username || selPlayer.name);
+    if (!alive) return;
+    setPlayerHist(rows);
+  })();
+  return () => { alive = false; };
+}, [selPlayer, room]);
+
 
   // Load past rounds when panel is opened
   useEffect(() => {
@@ -1282,7 +1307,7 @@ function costForPayloadPath(scenario, payload, playerPath) {
   return (
     <div className="rounded-2xl bg-gradient-to-br from-emerald-800/60 to-teal-900/60 p-6 ring-1 ring-white/10 shadow-xl">
       <h3 className="font-bold mb-2">Season Leaderboard</h3>
-      <div className="text-xs text-emerald-200 mb-3">Cumulative points across all rounds (20 − place, min 0).</div>
+      <div className="text-xs text-emerald-200 mb-3">Cumulative points across all rounds (24 − place, min 0).</div>
 
       <div className="space-y-2">
         {totals.length === 0 && <div className="text-emerald-200/80">No points yet.</div>}
@@ -1290,7 +1315,7 @@ function costForPayloadPath(scenario, payload, playerPath) {
           <div key={e.name} className={`flex items-center justify-between rounded-xl px-3 py-2 ${i === 0 ? "bg-yellow-500/20" : i === 1 ? "bg-slate-400/20" : i === 2 ? "bg-amber-700/30" : "bg-white/5"}`}>
             <div className="flex items-center gap-3">
               <Medal rank={i + 1} />
-              <div className="font-semibold">{e.name}</div>
+              <button className="font-semibold hover:underline" onClick={() => setSelectedPlayer(e.name)}>{e.name}</button>
             </div>
             <div className="text-right text-sm font-bold">{e.pts} pts</div>
           </div>
@@ -1298,6 +1323,35 @@ function costForPayloadPath(scenario, payload, playerPath) {
       </div>
 
       <ExportCsvButtonSeason room={room} />
+
+        {selectedPlayer && (
+  <div className="mt-4 rounded-xl border border-emerald-300/20 p-3">
+    <div className="flex items-center justify-between mb-2">
+      <div className="font-semibold">History — {selectedPlayer}</div>
+      <button className="text-xs bg-emerald-700 hover:bg-emerald-600 rounded px-2 py-1"
+              onClick={() => setSelectedPlayer(null)}>Close</button>
+    </div>
+    {!playerHistory.length && <div className="opacity-70">No past submissions.</div>}
+    <ul className="divide-y divide-emerald-300/20">
+      {playerHistory.map(h => (
+        <li key={`${h.roundId}`} className="py-2">
+          <div className="flex items-center justify-between">
+            <div>
+              <div className="text-xs opacity-80 font-mono">{new Date(h.startedAt).toLocaleString()}</div>
+              {h.path && (
+                <div className="text-[11px] opacity-75 font-mono">path: [{h.path.join(" → ")}]</div>
+              )}
+            </div>
+            <div className="text-right text-sm">
+              <div>Score: <span className="font-mono">{h.score ?? "—"}</span></div>
+              <div className="text-xs opacity-80">Cost: {h.cost != null ? Number(h.cost).toFixed(2) : "—"} • {h.timeSec ?? "—"}s</div>
+            </div>
+          </div>
+        </li>
+      ))}
+    </ul>
+  </div>
+)}
 
       {/* === Past Rounds === */}
       <div className="mt-6 rounded-xl border border-emerald-300/20 p-3">
@@ -1366,6 +1420,30 @@ function costForPayloadPath(scenario, payload, playerPath) {
                         </div>
                         <div className="rounded-lg border border-emerald-300/20 p[2px] p-2">
                           <div className="font-semibold mb-2">Players</div>
+                          {selPlayer && (
+                            <div className="mt-3 rounded-lg border border-emerald-300/20 p-2">
+                              <div className="font-semibold mb-2">History for {selPlayer.username || selPlayer.name}</div>
+                              <ul className="text-xs space-y-1 max-h-48 overflow-auto">
+                                {playerHist.map(h => (
+                                  <li key={`${h.round_id}-${h.started_at}`} className="flex items-center justify-between">
+                                    <span className="font-mono">
+                                      {new Date(h.started_at).toLocaleDateString()} • R{h.round_id}
+                                    </span>
+                                    <span className="font-mono">
+                                      {h.cost != null ? Number(h.cost).toFixed(2) : "—"} • {Math.round(h.score ?? 0)}
+                                    </span>
+                                  </li>
+                                ))}
+                                {!playerHist.length && <li className="opacity-70">No past submissions.</li>}
+                              </ul>
+                              {playerHist[0]?.path && (
+                                <div className="text-[11px] opacity-75 font-mono mt-2">
+                                  last path: [{(playerHist[0].path || []).join(" → ")}]
+                                </div>
+                              )}
+                            </div>
+                          )}
+
                           <ul className="space-y-1">
                             {subs.map(row => {
                               const name = row.username || row.user || row.name || "Player";
@@ -1841,21 +1919,39 @@ function SvgMap({ scenario, round = null, path = [], optPath = [], onClickNode, 
       })}
 
       {/* nodes (+ VRP demand badges) */}
-      {tnodes.map((n, i) => {
-        const demand = scenario.demand?.[n.id];
-        return (
-          <g key={n.id} onClick={() => !readonly && onClickNode?.(n.id)} className="cursor-pointer">
-            <circle cx={n.x} cy={n.y} r={12} fill={n.id === "S" ? "#16a34a" : n.id === "T" ? "#ef4444" : "#38bdf8"} stroke="#0ea5e9" strokeWidth="2" />
-            <text x={n.x} y={n.y + 4} textAnchor="middle" fontWeight="bold" fontSize="12" fill="white">{n.label || n.id}</text>
-            {Number.isFinite(demand) && (
-              <g>
-                <rect x={n.x + 14} y={n.y - 20} rx="4" ry="4" width="28" height="16" fill="#083344" stroke="#06b6d4" strokeWidth="1" />
-                <text x={n.x + 28} y={n.y - 8} textAnchor="middle" fontSize="10" fill="#67e8f9">{demand}</text>
-              </g>
-            )}
-          </g>
-        );
-      })}
+{tnodes.map((n, i) => {
+  const demand = scenario.demand?.[n.id];
+  const isS = n.id === "S";
+  const isT = n.id === "T";
+  const palette = ["#38bdf8", "#a78bfa", "#f97316", "#f43f5e", "#22d3ee", "#84cc16"];
+  const fill = isS ? "#16a34a" : isT ? "#ef4444" : palette[i % palette.length];
+  const stroke = isS ? "#22c55e" : isT ? "#fb7185" : "#0ea5e9";
+  const emoji = isS ? "🚩" : isT ? "🏁" : "•";
+
+  return (
+    <g key={n.id} onClick={() => !readonly && onClickNode?.(n.id)} className="cursor-pointer">
+      {/* outer glow ring */}
+      <circle cx={n.x} cy={n.y} r={16} fill="none" stroke={fill} strokeOpacity="0.35" strokeWidth="6" />
+      {/* main node */}
+      <circle cx={n.x} cy={n.y} r={12} fill={fill} stroke={stroke} strokeWidth="2" />
+      {/* label + small icon */}
+      <text x={n.x} y={n.y - 16} textAnchor="middle" fontSize="12" fill="#cbd5e1">{emoji}</text>
+      <text x={n.x} y={n.y + 4} textAnchor="middle" fontWeight="bold" fontSize="12" fill="white">
+        {n.label || n.id}
+      </text>
+
+      {/* demand badge (VRP) */}
+      {Number.isFinite(demand) && (
+        <g>
+          <rect x={n.x + 14} y={n.y - 20} rx="4" ry="4" width="28" height="16"
+                fill="#083344" stroke="#06b6d4" strokeWidth="1" />
+          <text x={n.x + 28} y={n.y - 8} textAnchor="middle" fontSize="10" fill="#67e8f9">{demand}</text>
+        </g>
+      )}
+    </g>
+  );
+})}
+
     </svg>
   );
 }
@@ -2030,7 +2126,7 @@ function downloadCsv(csv, filename) {
 function computeStandings(round) {
   const entries = Object.entries(round.players || {}).map(([name, r]) => ({ name, ...r }));
   entries.sort((a, b) => b.score - a.score || a.timeSec - b.timeSec);
-  const standings = entries.map((e, i) => ({ ...e, rank: i + 1, points: Math.max(0, 20 - (i + 1)) }));
+  const standings = entries.map((e, i) => ({ ...e, rank: i + 1, points: Math.max(0, 24 - (i + 1)) }));
   return standings;
 }
 
@@ -2644,15 +2740,26 @@ async function dbSaveRound(room, round) {
 
 
 async function dbUpsertSubmission(roundId, username, rec) {
-  await supabase.from("submissions").upsert({
-    round_id: roundId,
-    username,
-    cost: rec.cost,
-    time_sec: rec.timeSec,
-    score: rec.score,
-    path: rec.path,
-  });
+  const { error } = await supabase
+    .from("submissions")
+    .upsert(
+      {
+        round_id: roundId,
+        username,
+        cost: rec.cost,
+        time_sec: rec.timeSec,
+        score: rec.score,
+        path: rec.path, // array is fine if column is JSONB
+      },
+      { onConflict: "round_id,username", ignoreDuplicates: false }
+    );
+  if (error) {
+    console.error("dbUpsertSubmission error", error);
+  }
 }
+
+
+
 
 async function dbListSubmissions(roundId) {
   try {
@@ -2670,12 +2777,50 @@ async function dbListSubmissions(roundId) {
 }
 
 
+async function dbListPlayerHistory(room, username, limit = 50) {
+  try {
+    const { data, error } = await supabase
+      .from("submissions")
+      .select(`
+        id,
+        round_id,
+        username,
+        score,
+        cost,
+        time_sec,
+        path,
+        rounds!inner(id, room, started_at, payload)
+      `)
+      .eq("rounds.room", room)
+      .eq("username", username)
+      .order("rounds.started_at", { ascending: false })
+      .limit(limit);
+
+    if (error) { throw error; }
+    return (data || []).map(r => ({
+      round_id: r.round_id,
+      started_at: r.rounds.started_at,
+      payload: r.rounds.payload,
+      score: r.score,
+      cost: r.cost,
+      time_sec: r.time_sec,
+      path: r.path,
+    }));
+  } catch (e) {
+    console.error("dbListPlayerHistory error", e);
+    return [];
+  }
+}
+
+
+
+
 async function dbApplySeasonPoints(room, standings) {
   // standings = array of { name, rank } sorted by score
   const rows = standings.map((s) => ({
     room,
     username: s.name,
-    points: Math.max(0, 20 - s.rank),
+    points: Math.max(0, 24- s.rank),
   }));
   // Upsert by incrementing points
   for (const r of rows) {
