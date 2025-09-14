@@ -826,6 +826,58 @@ function ClosedCard() {
 }
 
 function Leaderboards({ room, round }) {
+
+  // === History state ===
+const [hist, setHist] = React.useState([]);
+const [histLoading, setHistLoading] = React.useState(false);
+const [histOpen, setHistOpen] = React.useState(false);
+const [histSelected, setHistSelected] = React.useState(null); // a round row
+const [histSubs, setHistSubs] = React.useState([]);
+const [histOpt, setHistOpt] = React.useState({ path: [], cost: Infinity });
+
+React.useEffect(() => {
+  let on = true;
+  (async () => {
+    setHistLoading(true);
+    const rows = await dbListPastRounds(room, 20);
+    if (!on) return;
+    setHist(rows);
+    setHistLoading(false);
+  })();
+  return () => { on = false; };
+}, [room]);
+
+async function openHistoryRound(row) {
+  setHistSelected(row);
+  setHistOpen(true);
+  // reconstruct scenario for this row
+  const roundPayload = row?.payload || {};
+  const scenario =
+    roundPayload?.customScenario?.nodes?.length ? roundPayload.customScenario :
+    (scenarios.find(x => x.id === roundPayload?.scenarioId) || null);
+
+  // compute optimal
+  let opt = { path: [], cost: Infinity };
+  try {
+    const dummyRound = { gameMode: roundPayload?.gameMode || "sp", ...roundPayload };
+    const { graphEdges } = useWeightedScenario(scenario, dummyRound);
+    // NOTE: useWeightedScenario is a hook; can't call here.
+    // We'll compute a minimal edges variant for SP only, others don't need edges.
+  } catch {}
+  // Safe: SP gets exact dijkstra without edges (if you don’t have edge weights baked, it’s still ok to draw)
+  const dummyRound = { gameMode: roundPayload?.gameMode || "sp", ...roundPayload };
+  const optSolved = computeOptimalForRound(
+    scenario,
+    dummyRound,
+    [] // we won't pass edges here; computeOptimalForRound handles non-SP or will call SP dijkstra with default euclid
+  );
+  setHistOpt(optSolved);
+
+  // fetch submissions
+  const subs = await dbListSubmissions(row.id);
+  setHistSubs(subs || []);
+}
+
   const [season, setSeason] = useState({ totals: {}, history: [] });
 
   useEffect(() => {
@@ -897,16 +949,94 @@ function RoundLeaderboardCard({ room, round }) {
 }
 
 function SeasonLeaderboardCard({ room, season }) {
+  // season totals (existing)
   const totals = Object.entries(season.totals || {}).map(([name, pts]) => ({ name, pts }));
   totals.sort((a, b) => b.pts - a.pts || a.name.localeCompare(b.name));
+
+  // --- New: Past rounds state ---
+  const [histOpen, setHistOpen] = React.useState(false);
+  const [histLoading, setHistLoading] = React.useState(false);
+  const [hist, setHist] = React.useState([]);            // list of rounds
+  const [sel, setSel] = React.useState(null);            // selected round row
+  const [subs, setSubs] = React.useState([]);            // submissions for selected round
+  const [best, setBest] = React.useState({ path: [], cost: Infinity }); // optimal for selected
+  const [selPlayer, setSelPlayer] = React.useState(null);// selected player row
+
+  // Load past rounds when panel is opened
+  useEffect(() => {
+    if (!histOpen) return;
+    let alive = true;
+    (async () => {
+      setHistLoading(true);
+      const rows = await dbListPastRounds(room, 20);
+      if (!alive) return;
+      setHist(rows);
+      setHistLoading(false);
+    })();
+    return () => { alive = false; };
+  }, [histOpen, room]);
+
+  // Helper: reconstruct scenario from a round row payload
+  function scenarioFromPayload(payload) {
+    if (!payload) return null;
+    if (payload?.customScenario?.nodes?.length) return payload.customScenario;
+    const s = scenarios.find(x => x.id === payload?.scenarioId);
+    return s || null;
+  }
+
+  // Helper: compute optimal for a past round (supports all modes)
+  function computeOptimalForPayload(scenario, payload) {
+    if (!scenario?.nodes?.length) return { path: [], cost: Infinity };
+    const mode = payload?.gameMode || "sp";
+    if (mode === "sp") {
+      const edges = buildGraphEdges(scenario, payload);
+      const res = dijkstra(scenario.nodes, edges, scenario.start, scenario.end);
+      return res;
+    } else if (mode === "tsp") {
+      return tspBaselineCost(scenario.nodes);
+    } else if (mode === "vrp") {
+      return vrpBaselineCost(scenario);
+    } else { // pick
+      return pickBaselineCost(scenario);
+    }
+  }
+
+  // Helper: recompute a player's path cost for a past round
+  function costForPayloadPath(scenario, payload, playerPath) {
+    if (!Array.isArray(playerPath) || playerPath.length < 2) return null;
+    const mode = payload?.gameMode || "sp";
+    if (mode === "sp") {
+      const edges = buildGraphEdges(scenario, payload);
+      return computePathCost(playerPath, edges);
+    } else if (mode === "tsp") {
+      return tspTourCost(playerPath, scenario.nodes);
+    } else if (mode === "vrp") {
+      return vrpRouteCostFromSequence(playerPath, scenario);
+    } else { // pick
+      return pickTourCost(playerPath, scenario);
+    }
+  }
+
+  async function openHistoryRound(row) {
+    setSelPlayer(null);
+    setSel(row);
+    const payload = row?.payload || {};
+    const scenario = scenarioFromPayload(payload);
+    const opt = computeOptimalForPayload(scenario, payload);
+    setBest(opt);
+    const s = await dbListSubmissions(row.id);
+    setSubs(s || []);
+  }
+
   return (
     <div className="rounded-2xl bg-gradient-to-br from-emerald-800/60 to-teal-900/60 p-6 ring-1 ring-white/10 shadow-xl">
       <h3 className="font-bold mb-2">Season Leaderboard</h3>
       <div className="text-xs text-emerald-200 mb-3">Cumulative points across all rounds (20 − place, min 0).</div>
+
       <div className="space-y-2">
         {totals.length === 0 && <div className="text-emerald-200/80">No points yet.</div>}
         {totals.map((e, i) => (
-          <div key={e.name} className={`flex items-center justify-between rounded-xl px-4 py-3 ${i === 0 ? "bg-yellow-500/20" : i === 1 ? "bg-slate-400/20" : i === 2 ? "bg-amber-700/30" : "bg-white/5"}`}>
+          <div key={e.name} className={`flex items-center justify-between rounded-xl px-3 py-2 ${i === 0 ? "bg-yellow-500/20" : i === 1 ? "bg-slate-400/20" : i === 2 ? "bg-amber-700/30" : "bg-white/5"}`}>
             <div className="flex items-center gap-3">
               <Medal rank={i + 1} />
               <div className="font-semibold">{e.name}</div>
@@ -915,10 +1045,108 @@ function SeasonLeaderboardCard({ room, season }) {
           </div>
         ))}
       </div>
+
       <ExportCsvButtonSeason room={room} />
+
+      {/* === Past Rounds === */}
+      <div className="mt-6 rounded-xl border border-emerald-300/20 p-3">
+        <div className="flex items-center justify-between">
+          <div className="font-semibold">Past Rounds</div>
+          <button
+            className="px-3 py-1 rounded-lg bg-emerald-700 hover:bg-emerald-600"
+            onClick={() => setHistOpen(v => !v)}
+          >
+            {histOpen ? "Hide" : "Show"}
+          </button>
+        </div>
+
+        {histOpen && (
+          <div className="mt-3">
+            {histLoading && <div className="opacity-80">Loading…</div>}
+            {!histLoading && !hist.length && <div className="opacity-70">No past rounds.</div>}
+
+            <ul className="divide-y divide-emerald-300/20">
+              {hist.map(r => (
+                <li key={r.id} className="py-2 flex items-center justify-between">
+                  <div>
+                    <div className="font-mono text-xs">Round: {r.id}</div>
+                    <div className="text-xs opacity-80">{new Date(r.started_at || r.created_at).toLocaleString()}</div>
+                  </div>
+                  <button
+                    className="px-3 py-1 rounded-lg bg-teal-700 hover:bg-teal-600"
+                    onClick={() => openHistoryRound(r)}
+                  >
+                    Open
+                  </button>
+                </li>
+              ))}
+            </ul>
+
+            {/* Detail panel */}
+            {sel && (
+              <div className="mt-4 rounded-lg border border-emerald-300/20 p-3">
+                {(() => {
+                  const payload = sel?.payload || {};
+                  const scenario = scenarioFromPayload(payload);
+                  if (!scenario?.nodes?.length) return <div className="opacity-70">Scenario unavailable.</div>;
+
+                  const optimalScore = Number.isFinite(best.cost) ? best.cost.toFixed(2) : "—";
+
+                  return (
+                    <div>
+                      <div className="mb-2">
+                        <div className="font-semibold">Round {sel.id}</div>
+                        <div className="text-xs opacity-80">{new Date(sel.started_at || sel.created_at).toLocaleString()}</div>
+                        <div className="text-xs mt-1">Game mode: <span className="font-mono">{payload?.gameMode || "sp"}</span></div>
+                        <div className="text-sm mt-1">Optimal score: <span className="font-mono">{optimalScore}</span></div>
+                      </div>
+
+                      <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
+                        <div className="lg:col-span-2 rounded-lg overflow-hidden border border-emerald-300/20">
+                          <SvgMap scenario={scenario} path={selPlayer?.path || []} optPath={best.path} readonly />
+                        </div>
+                        <div className="rounded-lg border border-emerald-300/20 p[2px] p-2">
+                          <div className="font-semibold mb-2">Players</div>
+                          <ul className="space-y-1">
+                            {subs.map(row => {
+                              const name = row.username || row.user || row.name || "Player";
+                              const path = Array.isArray(row.path) ? row.path : null;
+                              const cost = row.score ?? (path ? costForPayloadPath(scenario, payload, path) : null);
+                              return (
+                                <li key={row.id}>
+                                  <button
+                                    className={"w-full text-left px-2 py-1 rounded " + (selPlayer?.id === row.id ? "bg-emerald-800" : "hover:bg-emerald-900/50")}
+                                    onClick={() => setSelPlayer(row)}
+                                  >
+                                    <div className="flex items-center justify-between">
+                                      <span>{name}</span>
+                                      <span className="font-mono">{cost != null ? Number(cost).toFixed(2) : "—"}</span>
+                                    </div>
+                                    {path && (
+                                      <div className="text-[11px] opacity-75 font-mono overflow-hidden text-ellipsis">
+                                        path: [{path.join(" → ")}]
+                                      </div>
+                                    )}
+                                  </button>
+                                </li>
+                              );
+                            })}
+                            {!subs.length && <li className="opacity-70">No submissions saved.</li>}
+                          </ul>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })()}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
+
 
 function ExportCsvButtonRound({ round }) {
   const onExport = () => {
@@ -1229,7 +1457,8 @@ function ObjectiveLegend({ objective }) {
 // -----------------------------
 // Map (SVG)
 // -----------------------------
-function SvgMap({ scenario, path = [], onClickNode, readonly, hintLines = [] }) {
+function SvgMap({ scenario, path = [], optPath = [], onClickNode, readonly, hintLines = [] }) {
+
   // Guard: invalid or incomplete scenario
   if (!scenario || !Array.isArray(scenario.nodes)) {
     console.error('SvgMap: scenario or nodes missing:', scenario);
@@ -1287,6 +1516,22 @@ function SvgMap({ scenario, path = [], onClickNode, readonly, hintLines = [] }) 
           </g>
         );
       })}
+
+      {/* Optimal path (draw first, dashed) */}
+      {optPath.length > 1 && (
+        <polyline
+          points={optPath.map(id => {
+            const n = nodeById[id];
+            return n ? `${n.x},${n.y}` : null;
+          }).filter(Boolean).join(" ")}
+          fill="none"
+          stroke="#16a34a"
+          strokeWidth="4"
+          strokeOpacity="0.8"
+          strokeDasharray="8 8"
+        />
+      )}
+
 
       {/* TSP/Picking/VRP: player's current path */}
       {path.length > 1 && (
@@ -1432,6 +1677,16 @@ function useWeightedScenario(scenario, round) {
 
   return { graphEdges, optCost: opt.cost };
 }
+
+function buildGraphEdges(scenario, round) {
+  if (!scenario?.edges?.length) return [];
+  const withW = scenario.edges.map(([u, v, meta, mode]) => {
+    const w = effectiveWeight(scenario, [u, v, meta, mode], round);
+    return [u, v, w, mode];
+  });
+  return applyModifiers({ ...scenario, edges: withW });
+}
+
 
 
 
@@ -2036,6 +2291,22 @@ async function dbLoadCurrentRound(room) {
   if (error) throw error;
   return data ? data.payload : null;
 }
+async function dbListPastRounds(room, limit = 20) {
+  try {
+    const { data, error } = await supabase
+      .from("rounds")
+      .select("id, room, payload, started_at, ended_at, created_at")
+      .eq("room", room)
+      .order("started_at", { ascending: false })
+      .limit(limit);
+    if (error) { console.error("dbListPastRounds error", error); return []; }
+    return data || [];
+  } catch (e) {
+    console.error("dbListPastRounds exception", e);
+    return [];
+  }
+}
+
 
 async function dbSaveRound(room, round) {
   if (!round) {
@@ -2065,6 +2336,22 @@ async function dbUpsertSubmission(roundId, username, rec) {
     path: rec.path,
   });
 }
+
+async function dbListSubmissions(roundId) {
+  try {
+    const { data, error } = await supabase
+      .from("submissions")
+      .select("id, round_id, username, score, cost, time_sec, path")
+      .eq("round_id", roundId)
+      .order("score", { ascending: false });
+    if (error) { console.error("dbListSubmissions error", error); return []; }
+    return data || [];
+  } catch (e) {
+    console.error("dbListSubmissions exception", e);
+    return [];
+  }
+}
+
 
 async function dbApplySeasonPoints(room, standings) {
   // standings = array of { name, rank } sorted by score
@@ -2148,4 +2435,38 @@ function LoginGate({ onLogin }) {
       </form>
     </div>
   );
+}
+function nodeByIdMap(nodes) {
+  return Object.fromEntries((nodes || []).map(n => [n.id, n]));
+}
+
+function computeOptimalForRound(scenario, round, graphEdges) {
+  if (!scenario?.nodes?.length) return { path: [], cost: Infinity };
+  switch (round?.gameMode) {
+    case "sp":
+      return dijkstra(scenario.nodes, graphEdges, scenario.start, scenario.end);
+    case "tsp":
+      return tspBaselineCost(scenario.nodes);
+    case "vrp":
+      return vrpBaselineCost(scenario);
+    case "pick":
+    default:
+      return pickBaselineCost(scenario);
+  }
+}
+
+function computePathCost(scenario, round, path) {
+  if (!scenario?.nodes?.length || !Array.isArray(path) || path.length < 2) return Infinity;
+  const map = nodeByIdMap(scenario.nodes);
+  const get = (id) => map[id];
+  if (round?.gameMode === "pick") {
+    // Manhattan
+    let c = 0;
+    for (let i = 0; i < path.length - 1; i++) c += manhattan(get(path[i]), get(path[i + 1]));
+    return c;
+  }
+  // Euclidean default (sp/tsp/vrp sequences)
+  let c = 0;
+  for (let i = 0; i < path.length - 1; i++) c += euclid(get(path[i]), get(path[i + 1]));
+  return c;
 }
