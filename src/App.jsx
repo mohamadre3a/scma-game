@@ -165,18 +165,27 @@ async function loadRoomRound(room) {
   const cachedStr = localStorage.getItem(key);
   const cached = cachedStr ? JSON.parse(cachedStr) : null;
 
-  // Only trust cache if the round is OPEN
+  // Only trust cache if the round is OPEN; otherwise we may still keep it
+  // temporarily if the instructor revealed the leaderboard.
   if (cached?.isOpen) {
     if (!offline) {
       dbLoadCurrentRound(room).then((fresh) => {
-        if (!fresh) return;
-        const cStart = cached?.startedAt ?? 0;
-        const fStart = fresh?.startedAt ?? 0;
-        if (fStart >= cStart) {
-          localStorage.setItem(key, JSON.stringify(fresh));
+        if (fresh) {
+          const cStart = cached?.startedAt ?? 0;
+          const fStart = fresh?.startedAt ?? 0;
+          if (fStart >= cStart) {
+            localStorage.setItem(key, JSON.stringify(fresh));
+          }
+        } else {
+          // DB says no open round -> mark cache as closed so clients stop timer
+          const closed = { ...cached, isOpen: false, endsAt: cached?.endsAt || Date.now() };
+          localStorage.setItem(key, JSON.stringify(closed));
         }
       }).catch(() => {/* ignore */});
     }
+    return cached;
+  } else if (cached?.revealBoard) {
+    // Closed but leaderboard is being shown: keep cache so players see results
     return cached;
   } else {
     // closed/old cache → remove
@@ -454,6 +463,10 @@ function InstructorPanel({ room }) {
     }
   }, [round?.isOpen]);
 
+  if (round?.revealBoard) {
+    return <Leaderboards room={room} round={round} />;
+  }
+
   // Preview scenario (for SP) or generated nodes (for other modes)
   const baseScenario =
   gameMode === "sp"
@@ -522,7 +535,7 @@ function InstructorPanel({ room }) {
   const onReveal = async () => {
   if (!round) return;
   const now = Date.now();
-  const r = { ...round, revealBoard: true, isOpen: false, endsAt: round?.endsAt ?? now };
+  const r = { ...round, revealBoard: true, revealUntil: now + 60000, isOpen: false, endsAt: round?.endsAt ?? now };
   await saveRoomRound(room, r);
   setRound(r);
 };
@@ -1870,7 +1883,7 @@ function SvgMap({ scenario, round = null, path = [], optPath = [], onClickNode, 
   for (let i = 0; i < path.length - 1; i++) selected.add(path[i] + ">" + path[i + 1]);
 
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-[640px]">
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-[360px] md:h-[640px]">
       {/* base edges (SP) */}
       {edges.map(([u, v, w, m], idx) => {
         const a = nodeById[u], b = nodeById[v];
@@ -1882,7 +1895,7 @@ function SvgMap({ scenario, round = null, path = [], optPath = [], onClickNode, 
         return (
           <g key={`e${idx}`}>
             <line x1={a.x} y1={a.y} x2={b.x} y2={b.y}
-                  stroke={sel ? "#34d399" : "#94a3b8"} strokeWidth={sel ? 6 : 3} strokeOpacity={0.9} />
+                  stroke={sel ? "#34d399" : "#94a3b8"} strokeWidth={sel ? 7 : 4} strokeOpacity={0.9} strokeLinecap="round" />
             <EdgeLabel a={a} b={b} text={`${m || ""} ${showVal}`} />
           </g>
         );
@@ -1912,7 +1925,7 @@ function SvgMap({ scenario, round = null, path = [], optPath = [], onClickNode, 
           }).filter(Boolean).join(" ")}
           fill="none"
           stroke="#60a5fa"
-          strokeWidth="4"
+          strokeWidth="5"
           strokeOpacity="0.9"
         />
       )}
@@ -1943,12 +1956,12 @@ function SvgMap({ scenario, round = null, path = [], optPath = [], onClickNode, 
   return (
     <g key={n.id} onClick={() => !readonly && onClickNode?.(n.id)} className="cursor-pointer">
       {/* outer glow ring */}
-      <circle cx={n.x} cy={n.y} r={16} fill="none" stroke={fill} strokeOpacity="0.35" strokeWidth="6" />
+      <circle cx={n.x} cy={n.y} r={18} fill="none" stroke={fill} strokeOpacity="0.35" strokeWidth="6" />
       {/* main node */}
-      <circle cx={n.x} cy={n.y} r={12} fill={fill} stroke={stroke} strokeWidth="2" />
+      <circle cx={n.x} cy={n.y} r={14} fill={fill} stroke={stroke} strokeWidth="2" />
       {/* label + small icon */}
-      <text x={n.x} y={n.y - 16} textAnchor="middle" fontSize="12" fill="#cbd5e1">{emoji}</text>
-      <text x={n.x} y={n.y + 4} textAnchor="middle" fontWeight="bold" fontSize="12" fill="white">
+      <text x={n.x} y={n.y - 18} textAnchor="middle" fontSize="14" fill="#cbd5e1">{emoji}</text>
+      <text x={n.x} y={n.y + 5} textAnchor="middle" fontWeight="bold" fontSize="14" fill="white">
         {n.label || n.id}
       </text>
 
@@ -1985,11 +1998,11 @@ function EdgeLabel({ a, b, text }) {
   const ox = mx + nx * off, oy = my + ny * off;
 
   // dynamic width based on text length (approx char width 7px)
-  const w = Math.max(44, text.length * 7 + 10);
+  const w = Math.max(48, text.length * 8 + 12);
   return (
     <g>
-      <rect x={ox - w / 2} y={oy - 12} width={w} height={20} rx={8} fill="#111827" opacity={0.85} />
-      <text x={ox} y={oy + 3} textAnchor="middle" className="fill-white" style={{ fontSize: 11, fontWeight: 700 }}>
+      <rect x={ox - w / 2} y={oy - 14} width={w} height={24} rx={8} fill="#111827" opacity={0.85} />
+      <text x={ox} y={oy + 4} textAnchor="middle" className="fill-white" style={{ fontSize: 13, fontWeight: 700 }}>
         {text}
       </text>
     </g>
@@ -2086,26 +2099,28 @@ function useRound(room) {
     const tick = async () => {
       const r = await loadRoomRound(room);
       if (!alive) return;
-            // No active round → clear to null so Leaderboards show
-      if (!r || !r.isOpen) { setRound(null); return; }
+      if (!r) { setRound(null); return; }
 
-      // Auto-close if timer expired, then show Leaderboards
-      if (r.endsAt && Date.now() > r.endsAt) {
-        const closed = { ...r, isOpen: false };
+      // Hide leaderboards after reveal timeout
+      if (r.revealBoard && r.revealUntil && Date.now() > r.revealUntil) {
+        const closed = { ...r, revealBoard: false };
         await saveRoomRound(room, closed);
         setRound(null);
-      } else {
-        setRound(r);
+        return;
       }
 
-
-      if (r && r.isOpen && r.endsAt && Date.now() > r.endsAt) {
+      // Auto-close if timer expired
+      if (r.isOpen && r.endsAt && Date.now() > r.endsAt) {
         const closed = { ...r, isOpen: false };
         await saveRoomRound(room, closed); // persist closed state
-        if (alive) setRound(closed);
-      } else {
-        setRound(r);
+        setRound(r.revealBoard ? closed : null);
+        return;
       }
+
+      // If round is closed and not revealing, clear
+      if (!r.isOpen && !r.revealBoard) { setRound(null); return; }
+
+      setRound(r);
     };
 
     // initial fetch + polling
@@ -2205,7 +2220,8 @@ function makeCustomScenario(n = 12, objective = "time", opts = {}) {
   // Sort by x so edges naturally go left→right, then assign ids/labels
   pts.sort((a, b) => a.x - b.x);
   for (let i = 0; i < pts.length; i++) {
-    nodes.splice(nodes.length - 1, 0, { id: idFromIndex(i + 1), x: Math.round(pts[i].x), y: Math.round(pts[i].y), label: `N${i + 1}` });
+    const id = `N${i + 1}`;
+    nodes.splice(nodes.length - 1, 0, { id, x: Math.round(pts[i].x), y: Math.round(pts[i].y), label: id });
   }
 
   // --- 2) Build edges forward with distance-based metrics
@@ -2279,7 +2295,8 @@ function makeTspScenario(n = 10) {
   }
   pts.sort((a,b)=>a.x-b.x);
   for (let i=0;i<pts.length;i++){
-    nodes.push({ id: idFromIndex(i+1), x: Math.round(pts[i].x), y: Math.round(pts[i].y), label:`N${i+1}` });
+    const id = `N${i+1}`;
+    nodes.push({ id, x: Math.round(pts[i].x), y: Math.round(pts[i].y), label:id });
   }
   return { id:"tsp", title:`TSP (${n} nodes)`, subtitle:"Visit all, return to S", nodes, edges:[], start:"S", end:"S", _hasMetrics:true };
 }
@@ -2308,8 +2325,8 @@ function makeVrpScenario(customers = 12, capacity = 8) {
   pts.sort((a,b)=>a.x-b.x);
   const demand = {};
   for (let i=0;i<pts.length;i++){
-    const id = idFromIndex(i+1);
-    nodes.push({ id, x: Math.round(pts[i].x), y: Math.round(pts[i].y), label:`C${i+1}` });
+    const id = `C${i+1}`;
+    nodes.push({ id, x: Math.round(pts[i].x), y: Math.round(pts[i].y), label:id });
     demand[id] = randInt(1,4);
   }
   return { id:"vrp", title:`VRP (${customers} customers)`, subtitle:`Capacity ${capacity}`, nodes, edges:[], start:"S", end:"S", capacity, demand, _hasMetrics:true };
@@ -2338,7 +2355,8 @@ function makePickingScenario(rows=5, cols=8, picks=10){
     used.add(key); chosen.push(cells[k]);
   }
   for (let i=0;i<chosen.length;i++){
-    nodes.push({ id:idFromIndex(i+1), x:Math.round(chosen[i].x), y:Math.round(chosen[i].y), label:`P${i+1}` });
+    const id = `P${i+1}`;
+    nodes.push({ id, x:Math.round(chosen[i].x), y:Math.round(chosen[i].y), label:id });
   }
   return { id:"pick", title:`Warehouse Picking (${chosen.length} picks)`, subtitle:`Grid ${rows}×${cols}`, nodes, edges:[], start:"S", end:"S", metric:"manhattan", _hasMetrics:true };
 }
