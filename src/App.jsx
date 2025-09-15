@@ -1615,7 +1615,7 @@ function RoundLeaderboardCard({ room, round }) {
       <h2 className="text-xl font-bold mb-1">This Round — Room {room}</h2>
       <div className="text-xs text-slate-300">Scenario: {s.title}</div>
       <div className="text-xs text-slate-300 mb-4">
-  Optimal: {opt.path.join("→")} • {objLabel}: {fmt(opt.cost)}
+  Optimal: {formatPathLabels(s, opt.path, "→")} • {objLabel}: {fmt(opt.cost)}
 </div>
 
       <div className="space-y-2">
@@ -1794,8 +1794,11 @@ function costForPayloadPath(scenario, payload, playerPath) {
             <div>
               <div className="text-xs opacity-80 font-mono">{new Date(h.startedAt).toLocaleString()}</div>
               {h.path && (
-                <div className="text-[11px] opacity-75 font-mono">path: [{h.path.join(" → ")}]</div>
-              )}
+  <div className="text-[11px] opacity-75 font-mono">
+    path: [{formatPathLabels(scenarioFromPayload(h.payload), h.path, " → ")}]
+  </div>
+)}
+
             </div>
             <div className="text-right text-sm">
               <div>Score: <span className="font-mono">{h.score ?? "—"}</span></div>
@@ -1893,7 +1896,8 @@ function costForPayloadPath(scenario, payload, playerPath) {
                               </ul>
                               {playerHist[0]?.path && (
                                 <div className="text-[11px] opacity-75 font-mono mt-2">
-                                  last path: [{(playerHist[0].path || []).join(" → ")}]
+                                  last path: [{formatPathLabels(scenarioFromPayload(playerHist[0].payload), playerHist[0].path, " → ")}]
+
                                 </div>
                               )}
                             </div>
@@ -1942,9 +1946,16 @@ function costForPayloadPath(scenario, payload, playerPath) {
 
 function ExportCsvButtonRound({ round }) {
   const onExport = () => {
+    const sc = getScenarioFromRound(round);
     const rows = [["name","ingameScore","cost","timeSec","path"]];
     for (const [name, r] of Object.entries(round.players || {})) {
-      rows.push([name, r.score, r.cost, r.timeSec, (r.path || []).join("→")]);
+      rows.push([
+        name,
+        r.score,
+        r.cost,
+        r.timeSec,
+        formatPathLabels(sc, r.path || [], "→")
+      ]);
     }
     const csv = rows.map(row => row.map(csvEscape).join(",")).join("\n");
     downloadCsv(csv, `scma_round_${round.id}.csv`);
@@ -1955,6 +1966,7 @@ function ExportCsvButtonRound({ round }) {
     </button>
   );
 }
+
 
 function ExportCsvButtonSeason({ room }) {
   const onExport = async () => {
@@ -2306,7 +2318,9 @@ function SvgMap({ scenario, round = null, path = [], optPath = [], onClickNode, 
   });
 
   const tnodes = nodes.map(n => ({ ...n, ...tpos(n) }));
-  const nodeById = Object.fromEntries(tnodes.map(n => [n.id, n]));
+const vnodes = separateNodes(tnodes, W, H, 36, 24);  // render-only spacing
+const nodeById = Object.fromEntries(vnodes.map(n => [n.id, n]));
+
 
   // Highlight edges from player's path (SP)
   const selected = new Set();
@@ -2374,7 +2388,7 @@ function SvgMap({ scenario, round = null, path = [], optPath = [], onClickNode, 
       })}
 
       {/* nodes (+ VRP demand badges) */}
-{tnodes.map((n, i) => {
+{vnodes.map((n, i) => {
   const demand = scenario.demand?.[n.id];
   const isS = n.id === "S";
   const isT = n.id === "T";
@@ -2573,6 +2587,48 @@ function getScenarioFromRound(round) {
 
 
 function csvEscape(x) { return `"${String(x).replaceAll('"','""')}"`; }
+// === path/label helpers (display only) ===
+function nodeLabelFor(scenario, id) {
+  if (!scenario?.nodes) return String(id ?? "");
+  const hit = scenario.nodes.find(n => n?.id === id);
+  return hit?.label || String(id ?? "");
+}
+function formatPathLabels(scenario, path, sep = " → ") {
+  if (!scenario || !Array.isArray(path)) return "";
+  const map = new Map((scenario.nodes || []).map(n => [n.id, n.label || n.id]));
+  return path.map(id => map.get(id) ?? id).join(sep);
+}
+
+// === small geometry helper (render-only spacing; does not change scenario data) ===
+function separateNodes(nodes, W, H, min = 36, iters = 20) {
+  const clamped = v => Math.max(10, Math.min(v, (v === v ? v : 10))); // guard NaN
+  const out = nodes.map(n => ({ ...n })); // copy
+  for (let t = 0; t < iters; t++) {
+    let moved = false;
+    for (let i = 0; i < out.length; i++) {
+      for (let j = i + 1; j < out.length; j++) {
+        const a = out[i], b = out[j];
+        const dx = b.x - a.x, dy = b.y - a.y;
+        let d = Math.hypot(dx, dy);
+        if (!d) { d = 0.001; }
+        if (d < min) {
+          const push = (min - d) / 2;
+          const ux = dx / d, uy = dy / d;
+          // move both points away a little; clamp to viewbox
+          a.x = clamped(a.x - ux * push); a.y = clamped(a.y - uy * push);
+          b.x = clamped(b.x + ux * push); b.y = clamped(b.y + uy * push);
+          moved = true;
+        }
+      }
+    }
+    if (!moved) break;
+  }
+  // final clamp inside svg (fallback bounds if not in scope)
+  const w = Number.isFinite(W) ? W : 1200, h = Number.isFinite(H) ? H : 640;
+  for (const p of out) { p.x = Math.max(10, Math.min(p.x, w - 10)); p.y = Math.max(10, Math.min(p.y, h - 10)); }
+  return out;
+}
+
 
 function downloadCsv(csv, filename) {
   const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
