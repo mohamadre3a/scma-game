@@ -110,6 +110,370 @@ const scenarios = [
   },
 ];
 
+/* === Calgary SP Presets (6) === */
+const spCalgaryPresets = [
+{
+  id: "sp-yyc-downtown",
+  title: "YYC → Calgary Tower (Rush Hour)",
+  subtitle: "Directed roads: minimize time",
+  objective: "time",
+  nodes: [
+  { id: "YYC", x: 729, y: 160, label: "Calgary Intl (YYC)" },
+  { id: "MEM", x: 741, y: 259, label: "Deerfoot × Memorial" },
+  { id: "SUN", x: 757, y: 243, label: "Sunridge Mall" },
+  { id: "EV",  x: 621, y: 282, label: "East Village" },
+  { id: "ING", x: 682, y: 291, label: "Inglewood" },
+  { id: "CT",  x: 592, y: 285, label: "Calgary Tower" },
+  ],
+  start: "YYC",
+  end: "CT",
+  edges: [
+    ["YYC","MEM", {time:18, cost:32, co2:6.0}, "🚚"],
+    ["YYC","SUN", {time:15, cost:27, co2:5.0}, "🚚"],
+    ["SUN","EV",  {time:10, cost:18, co2:3.2}, "🚚"],
+    ["MEM","EV",  {time: 8, cost:14, co2:2.6}, "🚚"],
+    ["EV","CT",   {time: 4, cost: 7, co2:1.3}, "🚚"],
+    ["MEM","ING", {time: 7, cost:12, co2:2.3}, "🚚"],
+    ["ING","CT",  {time: 6, cost:10, co2:2.0}, "🚚"],
+  ],
+  modifiers: [
+    { id: "rush", label: "PM rush: Deerfoot leg +25%", affect: (e)=>(e[0]==="YYC"&&e[1]==="MEM"?1.25:1) },
+  ],
+  _hasMetrics: true
+},
+{
+  id: "sp-ucalgary-shc",
+  title: "UCalgary → South Health Campus",
+  subtitle: "NW to deep SE via Glenmore/Deerfoot",
+  objective: "time",
+  nodes: [
+    { id:"UC",  x: 412, y:238, label:"UCalgary" },
+    { id:"CG",  x: 412, y:353, label:"Crowchild × Glenmore" },
+    { id:"DG",  x: 729, y:365, label:"Deerfoot × Glenmore" },
+    { id:"CHI", x: 569, y:352, label:"Chinook Centre" },
+    { id:"SET", x: 865, y:532, label:"Seton" },
+    { id:"SHC", x: 865, y:519, label:"South Health Campus" },
+  ],
+  start:"UC", end:"SHC",
+  edges: [
+    ["UC","CG",   {time: 9, cost:16, co2:3.0}, "🚚"],
+    ["CG","DG",   {time:11, cost:19, co2:3.6}, "🚚"],
+    ["DG","SET",  {time:20, cost:34, co2:6.5}, "🚚"],
+    ["SET","SHC", {time: 3, cost: 5, co2:0.9}, "🚚"],
+    ["CG","CHI",  {time: 6, cost:10, co2:1.9}, "🚚"],
+    ["CHI","DG",  {time: 7, cost:12, co2:2.2}, "🚚"],
+    ["UC","CHI",  {time:14, cost:24, co2:4.6}, "🚚"],
+  ],
+  modifiers: [
+    { id:"glenmoreConstruction", label:"Glenmore work: CG→DG +30%", affect:(e)=>(e[0]==="CG"&&e[1]==="DG"?1.3:1) }
+  ],
+  _hasMetrics:true
+},
+{
+  id: "sp-ringroad-cim-wh",
+  title: "CrossIron → Westhills via Ring",
+  subtitle: "Prefer ring or cut through? Minimize cost",
+  objective: "cost",
+  nodes: [
+    { id:"CIM", x:801, y: 60, label:"CrossIron Mills" },
+    { id:"SNE", x:855, y:129, label:"Stoney Trail NE" },
+    { id:"SSE", x:862, y:428, label:"Stoney Trail SE" },
+    { id:"SSW", x:237, y:408, label:"Stoney Trail SW" },
+    { id:"WH",  x:325, y:320, label:"Westhills" },
+    { id:"DG",  x:729, y:365, label:"Deerfoot × Glenmore" },
+  ],
+  start:"CIM", end:"WH",
+  edges: [
+    ["CIM","SNE", {time: 6, cost:11, co2:2.0}, "🚚"],
+    ["SNE","SSE", {time:18, cost:31, co2:5.8}, "🚚"],
+    ["SSE","SSW", {time:16, cost:28, co2:5.2}, "🚚"],
+    ["SSW","WH",  {time: 7, cost:12, co2:2.3}, "🚚"],
+    ["SNE","DG",  {time:14, cost:24, co2:4.5}, "🚚"],
+    ["DG","WH",   {time:12, cost:21, co2:3.9}, "🚚"],
+  ],
+  modifiers: [
+    { id:"fuelSpike", label:"Fuel spike: ring road legs +15%", affect:(e)=>((["SNE","SSE","SSW"].includes(e[0]))?1.15:1) }
+  ],
+  _hasMetrics:true
+},
+{
+  id: "sp-fmc-yyc-green",
+  title: "Foothills → YYC (Cold Chain)",
+  subtitle: "Minimize CO₂ to keep cold chain green",
+  objective: "co2",
+  nodes: [
+    { id:"FMC", x:405, y:248, label:"Foothills Medical Centre" },
+    { id:"UC",  x:412, y:238, label:"UCalgary" },
+    { id:"MEM", x:700, y:272, label:"Memorial Dr Jct" },
+    { id:"YYC", x:729, y:160, label:"Calgary Intl (YYC)" },
+    { id:"SUN", x:757, y:243, label:"Sunridge Mall" },
+  ],
+  start:"FMC", end:"YYC",
+  edges: [
+    ["FMC","UC",  {time: 3, cost: 5, co2:0.9}, "🚚"],
+    ["UC","MEM",  {time: 7, cost:12, co2:2.2}, "🚚"],
+    ["MEM","YYC", {time:16, cost:28, co2:5.1}, "🚚"],
+    ["UC","SUN",  {time:16, cost:27, co2:5.0}, "🚚"],
+    ["SUN","YYC", {time: 6, cost:10, co2:1.8}, "🚚"],
+  ],
+  modifiers: [
+    { id:"priorityLane", label:"Bus lane on Memorial: UC→MEM −20%", affect:(e)=>(e[0]==="UC"&&e[1]==="MEM"?0.8:1) }
+  ],
+  _hasMetrics:true
+},
+{
+  id: "sp-dt-oneway",
+  title: "Downtown One-Way Puzzle",
+  subtitle: "Directed grid streets",
+  objective: "time",
+  nodes: [
+    { id:"EV",  x:621, y:282, label:"East Village" },
+    { id:"EC",  x:572, y:271, label:"Eau Claire" },
+    { id:"ST",  x:577, y:284, label:"Stephen Ave" },
+    { id:"KEN", x:533, y:272, label:"Kensington" },
+    { id:"CT",  x:592, y:285, label:"Calgary Tower" },
+  ],
+  start:"EV", end:"CT",
+  edges: [
+    ["EV","ST",  {time:3, cost:5, co2:1.0}, "🚚"],
+    ["ST","EC",  {time:3, cost:5, co2:1.0}, "🚚"],
+    ["EC","KEN", {time:4, cost:6, co2:1.2}, "🚚"],
+    ["KEN","CT", {time:5, cost:8, co2:1.6}, "🚚"],
+    ["EV","KEN", {time:7, cost:11, co2:2.0}, "🚚"],
+    ["KEN","EC", {time:3, cost:5, co2:1.0}, "🚚"],
+  ],
+  modifiers: [],
+  _hasMetrics:true
+},
+{
+  id: "sp-sait-ucalgary",
+  title: "SAIT → UCalgary",
+  subtitle: "Arterials vs collectors",
+  objective: "time",
+  nodes: [
+    { id:"SAIT", x:523, y:256, label:"SAIT" },
+    { id:"WB",   x:410, y:290, label:"Westbrook" },
+    { id:"ML",   x:466, y:323, label:"Marda Loop" },
+    { id:"BRE",  x:420, y:219, label:"Brentwood" },
+    { id:"UC",   x:412, y:238, label:"UCalgary" },
+  ],
+  start:"SAIT", end:"UC",
+  edges: [
+    ["SAIT","BRE",{time:8, cost:13, co2:2.6}, "🚚"],
+    ["BRE","UC",  {time:3, cost: 5, co2:0.9}, "🚚"],
+    ["SAIT","WB", {time:7, cost:12, co2:2.3}, "🚚"],
+    ["WB","UC",   {time:9, cost:15, co2:3.0}, "🚚"],
+    ["SAIT","ML", {time:10,cost:17, co2:3.3}, "🚚"],
+    ["ML","UC",   {time:12,cost:21, co2:3.8}, "🚚"],
+  ],
+  modifiers: [],
+  _hasMetrics:true
+},
+];
+
+/* === Calgary TSP Presets (6) === */
+const tspPresets = [
+{
+  id: "tsp-north-retail",
+  title: "North Retail Loop",
+  subtitle: "Visit all and return to S",
+  nodes: [
+    { id:"S", x:757, y:243, label:"Depot (SunridgeMall)" },
+    { id:"N1", x:801, y:60,  label:"CrossIronMills" },
+    { id:"N2", x:729, y:118, label:"AirdrieSouth" },
+    { id:"N3", x:729, y:160, label:"YYC" },
+    { id:"N4", x:855, y:129, label:"StoneyNE" },
+    { id:"N5", x:741, y:259, label:"DeerfootMemorial" },
+  ],
+  edges: [], start:"S", end:"S", _hasMetrics:true
+},
+{
+  id: "tsp-dt-loop",
+  title: "Downtown & Inner NW",
+  subtitle: "Visit all and return to S",
+  nodes: [
+    { id:"S",  x:572, y:271, label:"Depot (EauClaire)" },
+    { id:"N1", x:592, y:285, label:"CalgaryTower" },
+    { id:"N2", x:621, y:282, label:"EastVillage" },
+    { id:"N3", x:533, y:272, label:"Kensington" },
+    { id:"N4", x:410, y:290, label:"Westbrook" },
+    { id:"N5", x:682, y:291, label:"Inglewood" },
+  ],
+  edges: [], start:"S", end:"S", _hasMetrics:true
+},
+{
+  id: "tsp-nw-campus",
+  title: "Northwest Campus Tour",
+  subtitle: "Visit all and return to S",
+  nodes: [
+    { id:"S",  x:412, y:238, label:"Depot (UCalgary)" },
+    { id:"N1", x:523, y:256, label:"SAIT" },
+    { id:"N2", x:420, y:219, label:"Brentwood" },
+    { id:"N3", x:343, y:206, label:"Dalhousie" },
+    { id:"N4", x:405, y:248, label:"FoothillsMedical" },
+    { id:"N5", x:533, y:272, label:"Kensington" },
+  ],
+  edges: [], start:"S", end:"S", _hasMetrics:true
+},
+{
+  id: "tsp-south-corridor",
+  title: "South Corridor",
+  subtitle: "Visit all and return to S",
+  nodes: [
+    { id:"S",  x:569, y:352, label:"Depot (ChinookCentre)" },
+    { id:"N1", x:466, y:323, label:"MardaLoop" },
+    { id:"N2", x:865, y:532, label:"Seton" },
+    { id:"N3", x:865, y:519, label:"SouthHealthCampus" },
+    { id:"N4", x:729, y:365, label:"DeerfootGlenmore" },
+    { id:"N5", x:325, y:320, label:"Westhills" },
+  ],
+  edges: [], start:"S", end:"S", _hasMetrics:true
+},
+{
+  id: "tsp-ring-road",
+  title: "Ring Road Service",
+  subtitle: "Visit all and return to S",
+  nodes: [
+    { id:"S",  x:862, y:428, label:"Depot (StoneySE)" },
+    { id:"N1", x:855, y:129, label:"StoneyNE" },
+    { id:"N2", x:237, y:408, label:"StoneySW" },
+    { id:"N3", x:729, y:365, label:"DeerfootGlenmore" },
+    { id:"N4", x:325, y:320, label:"Westhills" },
+    { id:"N5", x:757, y:243, label:"SunridgeMall" },
+  ],
+  edges: [], start:"S", end:"S", _hasMetrics:true
+},
+{
+  id: "tsp-citywide-5",
+  title: "Citywide Five",
+  subtitle: "Visit all and return to S",
+  nodes: [
+    { id:"S",  x:592, y:284, label:"Depot (Downtown)" },
+    { id:"N1", x:729, y:160, label:"YYC" },
+    { id:"N2", x:325, y:320, label:"Westhills" },
+    { id:"N3", x:865, y:532, label:"Seton" },
+    { id:"N4", x:412, y:238, label:"UCalgary" },
+    { id:"N5", x:757, y:243, label:"SunridgeMall" },
+  ],
+  edges: [], start:"S", end:"S", _hasMetrics:true
+},
+];
+
+/* === Calgary VRP Presets (6) === */
+const vrpPresets = [
+{
+  id: "vrp-north-q",
+  title: "North Quadrant Parcels",
+  subtitle: "Capacity 8. Deliver to all customers and return to S.",
+  nodes: [
+    { id:"S",  x:757, y:243, label:"Depot (SunridgeMall)" },
+    { id:"C1", x:801, y:60,  label:"CrossIronMills" },
+    { id:"C2", x:729, y:118, label:"AirdrieSouth" },
+    { id:"C3", x:729, y:160, label:"YYC" },
+    { id:"C4", x:855, y:129, label:"StoneyNE" },
+    { id:"C5", x:741, y:259, label:"DeerfootMemorial" },
+    { id:"C6", x:700, y:272, label:"MemorialDriveJct" },
+  ],
+  edges: [], start:"S", end:"S", capacity: 8,
+  demand: { C1:2, C2:3, C3:2, C4:1, C5:2, C6:3 },
+  _hasMetrics:true
+},
+{
+  id: "vrp-dt-retail",
+  title: "Downtown Retail",
+  subtitle: "Capacity 7. Deliver to all customers and return to S.",
+  nodes: [
+    { id:"S",  x:592, y:284, label:"Depot (Downtown)" },
+    { id:"C1", x:572, y:271, label:"EauClaire" },
+    { id:"C2", x:592, y:285, label:"CalgaryTower" },
+    { id:"C3", x:621, y:282, label:"EastVillage" },
+    { id:"C4", x:533, y:272, label:"Kensington" },
+    { id:"C5", x:410, y:290, label:"Westbrook" },
+    { id:"C6", x:682, y:291, label:"Inglewood" },
+  ],
+  edges: [], start:"S", end:"S", capacity: 7,
+  demand: { C1:2, C2:1, C3:2, C4:1, C5:2, C6:1 },
+  _hasMetrics:true
+},
+{
+  id: "vrp-nw-health",
+  title: "NW Health Network",
+  subtitle: "Capacity 6. Deliver to all customers and return to S.",
+  nodes: [
+    { id:"S",  x:405, y:248, label:"Depot (FoothillsMedical)" },
+    { id:"C1", x:412, y:238, label:"UCalgary" },
+    { id:"C2", x:523, y:256, label:"SAIT" },
+    { id:"C3", x:420, y:219, label:"Brentwood" },
+    { id:"C4", x:343, y:206, label:"Dalhousie" },
+    { id:"C5", x:533, y:272, label:"Kensington" },
+  ],
+  edges: [], start:"S", end:"S", capacity: 6,
+  demand: { C1:1, C2:2, C3:2, C4:3, C5:1 },
+  _hasMetrics:true
+},
+{
+  id: "vrp-south-clinics",
+  title: "South Clinics",
+  subtitle: "Capacity 9. Deliver to all customers and return to S.",
+  nodes: [
+    { id:"S",  x:865, y:519, label:"Depot (SouthHealthCampus)" },
+    { id:"C1", x:865, y:532, label:"Seton" },
+    { id:"C2", x:729, y:365, label:"DeerfootGlenmore" },
+    { id:"C3", x:569, y:352, label:"ChinookCentre" },
+    { id:"C4", x:466, y:323, label:"MardaLoop" },
+    { id:"C5", x:325, y:320, label:"Westhills" },
+  ],
+  edges: [], start:"S", end:"S", capacity: 9,
+  demand: { C1:1, C2:3, C3:2, C4:2, C5:3 },
+  _hasMetrics:true
+},
+{
+  id: "vrp-ring-replen",
+  title: "Ring Replenishment",
+  subtitle: "Capacity 10. Deliver to all customers and return to S.",
+  nodes: [
+    { id:"S",  x:862, y:428, label:"Depot (StoneySE)" },
+    { id:"C1", x:855, y:129, label:"StoneyNE" },
+    { id:"C2", x:237, y:408, label:"StoneySW" },
+    { id:"C3", x:729, y:365, label:"DeerfootGlenmore" },
+    { id:"C4", x:325, y:320, label:"Westhills" },
+    { id:"C5", x:757, y:243, label:"SunridgeMall" },
+  ],
+  edges: [], start:"S", end:"S", capacity: 10,
+  demand: { C1:2, C2:3, C3:2, C4:2, C5:3 },
+  _hasMetrics:true
+},
+{
+  id: "vrp-citywide",
+  title: "Citywide Mix",
+  subtitle: "Capacity 10. Deliver to all customers and return to S.",
+  nodes: [
+    { id:"S",  x:569, y:352, label:"Depot (ChinookCentre)" },
+    { id:"C1", x:729, y:160, label:"YYC" },
+    { id:"C2", x:325, y:320, label:"Westhills" },
+    { id:"C3", x:865, y:532, label:"Seton" },
+    { id:"C4", x:412, y:238, label:"UCalgary" },
+    { id:"C5", x:757, y:243, label:"SunridgeMall" },
+    { id:"C6", x:572, y:271, label:"EauClaire" },
+  ],
+  edges: [], start:"S", end:"S", capacity: 10,
+  demand: { C1:3, C2:2, C3:3, C4:2, C5:3, C6:1 },
+  _hasMetrics:true
+},
+];
+
+/* === Scenario helpers/registry === */
+function findScenarioById(id) {
+  if (!id) return null;
+  return (
+    ([...scenarios, ...spCalgaryPresets].find(s => s.id === id)) ||
+    (tspPresets.find(s => s.id === id)) ||
+    (vrpPresets.find(s => s.id === id)) ||
+    null
+  );
+}
+
+
 // -----------------------------
 // Dijkstra (non-negative weights)
 // -----------------------------
@@ -439,6 +803,9 @@ function InstructorPanel({ room }) {
 
   // ===== TSP controls =====
   const [tspNodes, setTspNodes] = useState(10);
+  const [selTspScenario, setSelTspScenario] = useState("custom");
+  const [selVrpScenario, setSelVrpScenario] = useState("custom");
+
 
   // ===== VRP controls =====
   const [vrpCustomers, setVrpCustomers] = useState(12);
@@ -468,7 +835,8 @@ function InstructorPanel({ room }) {
   }
 
   // Preview scenario (for SP) or generated nodes (for other modes)
-  const baseScenario =
+  // Preview scenario (for SP) or generated/preset nodes (for other modes)
+const baseScenario =
   gameMode === "sp"
     ? (selScenario === "custom"
         ? (customScenario || makeCustomScenario(customNodes, customObjective, {
@@ -476,12 +844,17 @@ function InstructorPanel({ room }) {
           }))
         : selScenario === "builder"
         ? builderScenario
-        : scenarios.find((x) => x.id === (round?.scenarioId || selScenario)))
+        : ([...scenarios, ...spCalgaryPresets].find((x) => x.id === (round?.scenarioId || selScenario))))
     : gameMode === "tsp"
-    ? makeTspScenario(tspNodes)
+    ? (selTspScenario === "custom"
+        ? makeTspScenario(tspNodes)
+        : (tspPresets.find(x => x.id === (round?.scenarioId || selTspScenario))))
     : gameMode === "vrp"
-    ? makeVrpScenario(vrpCustomers, vrpCapacity)
+    ? (selVrpScenario === "custom"
+        ? makeVrpScenario(vrpCustomers, vrpCapacity)
+        : (vrpPresets.find(x => x.id === (round?.scenarioId || selVrpScenario))))
     : makePickingScenario(pickRows, pickCols, pickCount);
+
 
 
   const onOpen = async () => {
@@ -503,9 +876,18 @@ function InstructorPanel({ room }) {
       objA, objB, alpha,
     };
   } else if (gameMode === "tsp") {
+  if (selTspScenario === "custom") {
     payload = { scenarioId: "tsp", customScenario: makeTspScenario(tspNodes) };
-  } else if (gameMode === "vrp") {
+  } else {
+    payload = { scenarioId: selTspScenario }; // preset; no customScenario
+  }
+} else if (gameMode === "vrp") {
+  if (selVrpScenario === "custom") {
     payload = { scenarioId: "vrp", customScenario: makeVrpScenario(vrpCustomers, vrpCapacity) };
+  } else {
+    payload = { scenarioId: selVrpScenario }; // preset; no customScenario
+  }
+
   } else {
     payload = { scenarioId: "pick", customScenario: makePickingScenario(pickRows, pickCols, pickCount) };
   }
@@ -587,7 +969,8 @@ function InstructorPanel({ room }) {
                   <div>
                     <label className="block text-xs text-slate-300 mb-1">Scenario</label>
                     <select value={selScenario} onChange={(e)=>setSelScenario(e.target.value)} className="bg-white/10 rounded-xl px-4 py-2.5 w-full">
-                      {scenarios.map(s => <option key={s.id} value={s.id}>{s.title}</option>)}
+                      {[...scenarios, ...spCalgaryPresets].map(s => <option key={s.id} value={s.id}>{s.title}</option>)}
+
                       <option value="custom">Custom (Generated)</option>
                       <option value="builder">Custom (Manual Builder)</option>
                     </select>
@@ -669,34 +1052,80 @@ function InstructorPanel({ room }) {
             )}
 
             {gameMode === "tsp" && (
-              <div className="grid md:grid-cols-3 gap-4">
-                <div>
-                  <label className="block text-xs text-slate-300 mb-1"># Nodes (incl. depot)</label>
-                  <input type="number" min={6} max={18} value={tspNodes}
-                         onChange={(e)=>setTspNodes(Number(e.target.value))}
-                         className="bg-white/10 rounded-xl px-4 py-2.5 w-full" />
-                  <div className="text-xs text-slate-400 mt-1">Visit all, return to S. Baseline uses NN + 2-opt.</div>
-                </div>
-              </div>
-            )}
+  <div className="grid md:grid-cols-3 gap-4">
+    <div>
+      <label className="block text-xs text-slate-300 mb-1">Scenario</label>
+      <select
+        value={selTspScenario}
+        onChange={(e)=>setSelTspScenario(e.target.value)}
+        className="bg-white/10 rounded-xl px-4 py-2.5 w-full"
+      >
+        <option value="custom">Custom (Generated)</option>
+        {tspPresets.map(s => <option key={s.id} value={s.id}>{s.title}</option>)}
+      </select>
+      {selTspScenario !== "custom" && (
+        <div className="text-xs text-slate-400 mt-1">
+          {(tspPresets.find(x=>x.id===selTspScenario)||{}).subtitle}
+        </div>
+      )}
+    </div>
+    {selTspScenario === "custom" && (
+      <div>
+        <label className="block text-xs text-slate-300 mb-1"># Nodes (incl. depot)</label>
+        <input
+          type="number" min={6} max={18} value={tspNodes}
+          onChange={(e)=>setTspNodes(Number(e.target.value))}
+          className="bg-white/10 rounded-xl px-4 py-2.5 w-full"
+        />
+        <div className="text-xs text-slate-400 mt-1">Visit all, return to S. Baseline uses NN + 2-opt.</div>
+      </div>
+    )}
+  </div>
+)}
+
 
             {gameMode === "vrp" && (
-              <div className="grid md:grid-cols-3 gap-4">
-                <div>
-                  <label className="block text-xs text-slate-300 mb-1"># Customers</label>
-                  <input type="number" min={6} max={30} value={vrpCustomers}
-                         onChange={(e)=>setVrpCustomers(Number(e.target.value))}
-                         className="bg-white/10 rounded-xl px-4 py-2.5 w-full" />
-                </div>
-                <div>
-                  <label className="block text-xs text-slate-300 mb-1">Vehicle Capacity</label>
-                  <input type="number" min={4} max={20} value={vrpCapacity}
-                         onChange={(e)=>setVrpCapacity(Number(e.target.value))}
-                         className="bg-white/10 rounded-xl px-4 py-2.5 w-full" />
-                  <div className="text-xs text-slate-400 mt-1">Demand per customer is 1–4.</div>
-                </div>
-              </div>
-            )}
+  <div className="grid md:grid-cols-3 gap-4">
+    <div>
+      <label className="block text-xs text-slate-300 mb-1">Scenario</label>
+      <select
+        value={selVrpScenario}
+        onChange={(e)=>setSelVrpScenario(e.target.value)}
+        className="bg-white/10 rounded-xl px-4 py-2.5 w-full"
+      >
+        <option value="custom">Custom (Generated)</option>
+        {vrpPresets.map(s => <option key={s.id} value={s.id}>{s.title}</option>)}
+      </select>
+      {selVrpScenario !== "custom" && (
+        <div className="text-xs text-slate-400 mt-1">
+          {(vrpPresets.find(x=>x.id===selVrpScenario)||{}).subtitle}
+        </div>
+      )}
+    </div>
+    {selVrpScenario === "custom" && (
+      <>
+        <div>
+          <label className="block text-xs text-slate-300 mb-1"># Customers</label>
+          <input
+            type="number" min={6} max={30} value={vrpCustomers}
+            onChange={(e)=>setVrpCustomers(Number(e.target.value))}
+            className="bg-white/10 rounded-xl px-4 py-2.5 w-full"
+          />
+        </div>
+        <div>
+          <label className="block text-xs text-slate-300 mb-1">Vehicle Capacity</label>
+          <input
+            type="number" min={4} max={20} value={vrpCapacity}
+            onChange={(e)=>setVrpCapacity(Number(e.target.value))}
+            className="bg-white/10 rounded-xl px-4 py-2.5 w-full"
+          />
+          <div className="text-xs text-slate-400 mt-1">Demand per customer is 1–4.</div>
+        </div>
+      </>
+    )}
+  </div>
+)}
+
 
             {gameMode === "pick" && (
               <div className="grid md:grid-cols-4 gap-4">
@@ -1266,11 +1695,12 @@ useEffect(() => {
 
   // Helper: reconstruct scenario from a round row payload
   function scenarioFromPayload(payload) {
-    if (!payload) return null;
-    if (payload?.customScenario?.nodes?.length) return payload.customScenario;
-    const s = scenarios.find(x => x.id === payload?.scenarioId);
-    return s || null;
-  }
+  if (!payload) return null;
+  if (payload?.customScenario?.nodes?.length) return payload.customScenario;
+  const s = findScenarioById(payload?.scenarioId);
+  return s || null;
+}
+
 
   // Helper: compute optimal for a past round (supports all modes)
  function computeOptimalForPayload(scenario, payload) {
@@ -2136,9 +2566,10 @@ function useRound(room) {
 function getScenarioFromRound(round) {
   if (!round) return null;
   if (round.customScenario?.nodes?.length) return round.customScenario;
-  const s = scenarios.find((x) => x.id === round.scenarioId);
+  const s = findScenarioById(round.scenarioId);
   return s ?? null;
 }
+
 
 
 function csvEscape(x) { return `"${String(x).replaceAll('"','""')}"`; }
