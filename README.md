@@ -12,8 +12,8 @@ It helps students wake up in morning lectures and learn key logistics concepts b
   - **Traveling Salesperson (TSP)**.
   - **Vehicle Routing Problem (VRP)** with capacity constraints.
   - **Warehouse Order-Picking** with Manhattan distance.
-- Leaderboard with cumulative season points:
-  - `points = 20 – placement` (e.g., 1st = 19 pts).
+  - Leaderboard with cumulative season points:
+    - `points = 24 – placement` (e.g., 1st = 23 pts).
 - Student login via **username + PIN** (from CSV roster).
 - Persistent data storage with **Supabase** (does not reset on redeploy).
 - Export round/season results to CSV.
@@ -37,7 +37,7 @@ It helps students wake up in morning lectures and learn key logistics concepts b
 - **Base:** `1000 × (optimal cost ÷ your cost)`.
 - **Time bonus:** `max(0, 200 − seconds used)`.
 - **Total score:** base + time bonus (higher is better).
-- **Goal:** maximize your score to rank high and earn season points (`20 − place`).
+- **Goal:** maximize your score to rank high and earn season points (`24 − place`).
 
 ---
 
@@ -57,7 +57,8 @@ It helps students wake up in morning lectures and learn key logistics concepts b
 3. Create `.env.local`:
    ```env
    VITE_SUPABASE_URL=your_supabase_url
-   VITE_SUPABASE_ANON_KEY=your_supabase_key
+    VITE_SUPABASE_ANON_KEY=your_supabase_key
+    VITE_INSTRUCTOR_PIN=your_secret_pin
    ```
 
 4. Run dev server:
@@ -132,8 +133,8 @@ Custom domain? Point `scma.shahsahebi.com` (CNAME) → Vercel.
 
 - **Round Score:** `score = 1000 × (baseline / your cost) + max(0, 200 − time in seconds)`.
 - **Season Points:**
-  - Placement → `20 – rank`.
-  - Example: 1st = 19 pts, 5th = 15 pts, ≥20th = 0.
+  - Placement → `24 – rank`.
+  - Example: 1st = 23 pts, 5th = 19 pts, ≥24th = 0.
 - Non-submitters get **0**.
 
 ---

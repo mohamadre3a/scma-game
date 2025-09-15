@@ -1,11 +1,12 @@
 import React, { useMemo, useRef, useState, useEffect } from "react";
+import { computeStandings } from "./lib/standings";
 
 /**
  * SCMA Morning Dash — Shortest Path Race (v2)
  * -------------------------------------------------------------
  * New in v2 (your requests):
  * 1) Persistent season leaderboard that accumulates points across rounds
- *    - Round points = max(0, 20 - place). Non-submitters get 0.
+ *    - Round points = max(0, 24 - place). Non-submitters get 0.
  * 2) Instructor-set countdown per round; auto-close when timer ends.
  * 3) Instructor can generate a custom network with a chosen node count.
  * 4) Sleeker UI sections for Round vs Season leaderboards + CSV exports.
@@ -15,7 +16,7 @@ import React, { useMemo, useRef, useState, useEffect } from "react";
  * - For class-scale real-time, we’ll wire Supabase next (drop-in).
  */
 
-const INSTRUCTOR_PIN = "13741374";
+const INSTRUCTOR_PIN = import.meta.env.VITE_INSTRUCTOR_PIN;
 
 // -----------------------------
 // Static Scenarios (you can still use these)
@@ -2147,14 +2148,6 @@ function downloadCsv(csv, filename) {
   const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
   const url = URL.createObjectURL(blob); const a = document.createElement("a");
   a.href = url; a.download = filename; a.click(); URL.revokeObjectURL(url);
-}
-
-// Season scoring
-function computeStandings(round) {
-  const entries = Object.entries(round.players || {}).map(([name, r]) => ({ name, ...r }));
-  entries.sort((a, b) => b.score - a.score || a.timeSec - b.timeSec);
-  const standings = entries.map((e, i) => ({ ...e, rank: i + 1, points: Math.max(0, 24 - (i + 1)) }));
-  return standings;
 }
 
 async function applySeasonPoints(room, round, standings /* array */) {
