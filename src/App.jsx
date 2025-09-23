@@ -359,6 +359,286 @@ const tspPresets = [
 },
 ];
 
+
+/** ============================== TRANSPORTATION / TRANSSHIPMENT HELPERS ==============================
+ * Provides:
+ *  - tpEvaluate(scenario, X) -> { feasible, totalCost, violations[] } for classroom validation
+ *  - tpOptimalCost(scenario) -> { cost, flows }  (classic transportation)
+ *  - tsOptimalCost(scenario) -> { cost, flows }  (with hubs and allowed arcs)
+ */
+
+function buildTpArcs(scn) {
+  const edges = [];
+  if (scn?.supplies && scn?.demands && scn?.cost) {
+    for (const s of scn.supplies) {
+      for (const d of scn.demands) {
+        const key = `${s.id}>${d.id}`;
+        if (scn.cost[key] != null) {
+          edges.push({ u: s.id, v: d.id, cost: Number(scn.cost[key]), cap: Infinity });
+        }
+      }
+    }
+  }
+  return edges;
+}
+
+/** General min-cost flow (successive shortest augmenting path with potentials). */
+function minCostFlow(nodes, arcs, supplies, demands) {
+  const N = [...new Set(nodes)];
+  const id2idx = new Map(N.map((id, i) => [id, i]));
+  const SS = "__SS__", TT = "__TT__";
+  if (!id2idx.has(SS)) { id2idx.set(SS, N.length); N.push(SS); }
+  if (!id2idx.has(TT)) { id2idx.set(TT, N.length); N.push(TT); }
+
+  function Edge(to, rev, cap, cost, key) { this.to=to; this.rev=rev; this.cap=cap; this.cost=cost; this.key=key||null; }
+  const G = Array.from({length: N.length}, () => []);
+  function addEdge(u, v, cap, cost, key) {
+    const ui = id2idx.get(u) ?? (id2idx.set(u,N.length), N.push(u), G.push([]), id2idx.get(u));
+    const vi = id2idx.get(v) ?? (id2idx.set(v,N.length), N.push(v), G.push([]), id2idx.get(v));
+    G[ui].push(new Edge(vi, G[vi].length, cap, cost, key));
+    G[vi].push(new Edge(ui, G[ui].length-1, 0, -cost, null));
+  }
+
+  // Add network arcs
+  for (const a of (arcs||[])) {
+    const cap = Number.isFinite(a.cap) ? a.cap : 1e15;
+    addEdge(a.u, a.v, cap, a.cost, `${a.u}>${a.v}`);
+  }
+
+  // Link supplies and demands to super source/sink
+  let totalSupply = 0, totalDemand = 0;
+  for (const [id, q] of Object.entries(supplies || {})) { addEdge(SS, id, q, 0, null); totalSupply += q; }
+  for (const [id, q] of Object.entries(demands || {})) { addEdge(id, TT, q, 0, null); totalDemand += q; }
+  if (Math.round(totalSupply) !== Math.round(totalDemand)) {
+    return { feasible: false, cost: Infinity, flows: {}, msg: `Unbalanced: supply=${totalSupply} ≠ demand=${totalDemand}` };
+  }
+
+  const n = N.length, INF = 1e18;
+  let flow = 0, cost = 0;
+  const pot = Array(n).fill(0), parentV = Array(n).fill(-1), parentE = Array(n).fill(-1);
+  const resultFlows = {};
+
+  function dijkstra(s, t) {
+    const dist = Array(n).fill(INF); dist[s] = 0;
+    const used = Array(n).fill(false);
+    for (let k=0; k<n; k++) {
+      let u = -1, best = INF;
+      for (let i=0; i<n; i++) if (!used[i] && dist[i] < best) { best = dist[i]; u = i; }
+      if (u === -1) break;
+      used[u] = true;
+      for (let ei=0; ei<G[u].length; ei++) {
+        const e = G[u][ei]; if (e.cap <= 0) continue;
+        const w = e.to, rc = e.cost + pot[u] - pot[w], nd = dist[u] + rc;
+        if (nd < dist[w]) { dist[w] = nd; parentV[w] = u; parentE[w] = ei; }
+      }
+    }
+    for (let i=0; i<n; i++) if (dist[i] < INF) pot[i] += dist[i];
+    return dist[t] < INF;
+  }
+
+  const s = id2idx.get(SS), t = id2idx.get(TT);
+  while (flow < totalDemand && dijkstra(s, t)) {
+    let add = INF;
+    for (let v=t; v!==s; v = parentV[v]) add = Math.min(add, G[parentV[v]][parentE[v]].cap);
+    for (let v=t; v!==s; v = parentV[v]) {
+      const u = parentV[v], ei = parentE[v], e = G[u][ei], r = G[v][e.rev];
+      e.cap -= add; r.cap += add;
+      if (e.key) { resultFlows[e.key] = (resultFlows[e.key] || 0) + add; cost += add * e.cost; }
+    }
+    flow += add;
+  }
+  const feasible = (flow === totalDemand);
+  return { feasible, cost: feasible ? cost : Infinity, flows: resultFlows, msg: feasible ? null : "Could not push all demand." };
+}
+
+/** Player submission checker for Transportation (matrix X: { "S>D": qty }) */
+function tpEvaluate(scn, X) {
+  const sup = Object.fromEntries((scn.supplies||[]).map(s => [s.id, Number(s.supply||0)]));
+  const dem = Object.fromEntries((scn.demands||[]).map(d => [d.id, Number(d.demand||0)]));
+  const row = Object.fromEntries(Object.keys(sup).map(k => [k, 0]));
+  const col = Object.fromEntries(Object.keys(dem).map(k => [k, 0]));
+  let totalCost = 0, violations = [];
+  for (const [key, qRaw] of Object.entries(X||{})) {
+    const q = Number(qRaw||0);
+    const [s, d] = key.split(">");
+    if (!(s in sup) || !(d in dem)) continue;
+    row[s] += q; col[d] += q;
+    const c = scn.cost?.[key];
+    if (c == null) violations.push(`Arc ${key} not allowed.`);
+    else totalCost += q * Number(c);
+  }
+  for (const s of Object.keys(sup)) if (Math.round(row[s]) !== Math.round(sup[s])) violations.push(`Supply ${s}: sent ${row[s]} ≠ ${sup[s]}`);
+  for (const d of Object.keys(dem)) if (Math.round(col[d]) !== Math.round(dem[d])) violations.push(`Demand ${d}: recv ${col[d]} ≠ ${dem[d]}`);
+  return { feasible: violations.length === 0, totalCost, violations };
+}
+
+function tpOptimalCost(scn) {
+  const nodes = [...(scn.supplies||[]).map(s=>s.id), ...(scn.demands||[]).map(d=>d.id)];
+  const edges = buildTpArcs(scn);
+  const supplies = Object.fromEntries((scn.supplies||[]).map(s => [s.id, Number(s.supply||0)]));
+  const demands = Object.fromEntries((scn.demands||[]).map(d => [d.id, Number(d.demand||0)]));
+  return minCostFlow(nodes, edges, supplies, demands);
+}
+
+/** Transshipment optimal (supply -> hubs -> demand; arcs define what's allowed). */
+function tsOptimalCost(scn) {
+  const nodes = [
+    ...(scn.supplies||[]).map(s=>s.id),
+    ...(scn.hubs||[]).map(h=>h.id),
+    ...(scn.demands||[]).map(d=>d.id),
+  ];
+  const supplies = Object.fromEntries((scn.supplies||[]).map(s => [s.id, Number(s.supply||0)]));
+  const demands = Object.fromEntries((scn.demands||[]).map(d => [d.id, Number(d.demand||0)]));
+  const arcs = (scn.arcs||[]).map(a => ({u:a.u, v:a.v, cost:Number(a.cost), cap:Number.isFinite(a.cap)?a.cap:Infinity}));
+  // Optional hub caps (throughput): comment out if you don't need.
+  for (const h of (scn.hubs||[])) {
+    if (Number.isFinite(h.cap)) {
+      arcs.push({u:"__SS__", v:h.id, cost:0, cap:h.cap});
+      arcs.push({u:h.id, v:"__TT__", cost:0, cap:h.cap});
+    }
+  }
+  return minCostFlow(nodes, arcs, supplies, demands);
+}
+
+
+
+// ===== TRANSPORTATION (TP) PRESETS — CANADA/CALGARY =====
+
+// 1) Alberta Grocers — plants in Calgary/Edmonton to AB cities
+const tpAlbertaGrocers = {
+  id: "tp-alberta-grocers",
+  title: "AB Grocers — Calgary/Edmonton → Lethbridge/Red Deer/Med Hat/FMM",
+  supplies: [
+    { id: "CalgaryPlant",  label: "Calgary Plant",  supply: 60 },
+    { id: "EdmontonPlant", label: "Edmonton Plant", supply: 40 },
+  ],
+  demands: [
+    { id: "Lethbridge",   label: "Lethbridge",    demand: 20 },
+    { id: "RedDeer",      label: "Red Deer",      demand: 20 },
+    { id: "MedicineHat",  label: "Medicine Hat",  demand: 25 },
+    { id: "FortMcMurray", label: "Fort McMurray", demand: 35 },
+  ],
+  // Rough per-unit costs (smaller ≈ closer)
+  cost: {
+    "CalgaryPlant>Lethbridge": 2,
+    "CalgaryPlant>RedDeer": 3,
+    "CalgaryPlant>MedicineHat": 4,
+    "CalgaryPlant>FortMcMurray": 9,
+
+    "EdmontonPlant>Lethbridge": 7,
+    "EdmontonPlant>RedDeer": 2,
+    "EdmontonPlant>MedicineHat": 8,
+    "EdmontonPlant>FortMcMurray": 5,
+  },
+};
+
+// 2) West Coast Ports → Prairies — Vancouver / Prince Rupert to AB/SK cities
+const tpWestPortsPrairies = {
+  id: "tp-west-ports-prairies",
+  title: "West Ports → Prairies — Vancouver/Prince Rupert → Calgary/Edmonton/Regina/Saskatoon",
+  supplies: [
+    { id: "PortVancouver",   label: "Port Vancouver",   supply: 70 },
+    { id: "PrinceRupertPort",label: "Prince Rupert Port", supply: 30 },
+  ],
+  demands: [
+    { id: "Calgary",   label: "Calgary",   demand: 35 },
+    { id: "Edmonton",  label: "Edmonton",  demand: 25 },
+    { id: "Regina",    label: "Regina",    demand: 20 },
+    { id: "Saskatoon", label: "Saskatoon", demand: 20 },
+  ],
+  cost: {
+    "PortVancouver>Calgary": 6,
+    "PortVancouver>Edmonton": 7,
+    "PortVancouver>Regina": 9,
+    "PortVancouver>Saskatoon": 10,
+
+    "PrinceRupertPort>Calgary": 8,
+    "PrinceRupertPort>Edmonton": 6,
+    "PrinceRupertPort>Regina": 10,
+    "PrinceRupertPort>Saskatoon": 9,
+  },
+};
+
+// ===== TRANSSHIPMENT (TS) PRESETS — CANADA/CALGARY =====
+
+// 3) Alberta Hubs — Airdrie/Nisku DCs → (Red Deer / Lethbridge) hubs → AB cities
+const tsAlbertaHubs = {
+  id: "ts-alberta-hubs",
+  title: "AB Hubs — Airdrie/Nisku DC → Red Deer & Lethbridge Crossdocks → Cities",
+  supplies: [
+    { id: "AirdrieDC", label: "Airdrie DC", supply: 55 },
+    { id: "NiskuDC",   label: "Nisku DC",   supply: 45 },
+  ],
+  hubs: [
+    { id: "RedDeerXDock",     label: "Red Deer Crossdock" },
+    { id: "LethbridgeXDock",  label: "Lethbridge Crossdock" },
+  ],
+  demands: [
+    { id: "Calgary",       label: "Calgary",        demand: 40 },
+    { id: "Edmonton",      label: "Edmonton",       demand: 35 },
+    { id: "MedicineHat",   label: "Medicine Hat",   demand: 15 },
+    { id: "FortMcMurray",  label: "Fort McMurray",  demand: 10 },
+  ],
+  // Only listed arcs are allowed (this enforces which hub can serve which cities)
+  arcs: [
+    // Supply → Hubs
+    { u: "AirdrieDC", v: "RedDeerXDock",    cost: 2 },
+    { u: "AirdrieDC", v: "LethbridgeXDock", cost: 3 },
+    { u: "NiskuDC",   v: "RedDeerXDock",    cost: 2 },
+    { u: "NiskuDC",   v: "LethbridgeXDock", cost: 5 },
+
+    // Hubs → Demand
+    { u: "RedDeerXDock",    v: "Calgary",       cost: 2 },
+    { u: "RedDeerXDock",    v: "Edmonton",      cost: 2 },
+    { u: "RedDeerXDock",    v: "FortMcMurray",  cost: 7 },
+
+    { u: "LethbridgeXDock", v: "Calgary",       cost: 2 },
+    { u: "LethbridgeXDock", v: "MedicineHat",   cost: 1 },
+  ],
+};
+
+// 4) Western Intermodal — Vancouver / Prince Rupert → (Winnipeg / Regina) hubs → Prairie cities
+const tsWesternIntermodal = {
+  id: "ts-western-intermodal",
+  title: "Western Intermodal — Ports → Winnipeg/Regina Hubs → Calgary/Edmonton/Saskatoon/Regina",
+  supplies: [
+    { id: "PortVancouver",   label: "Port Vancouver",     supply: 60 },
+    { id: "PrinceRupertPort",label: "Prince Rupert Port", supply: 40 },
+  ],
+  hubs: [
+    { id: "WinnipegIC", label: "Winnipeg Intermodal" },
+    { id: "ReginaIC",   label: "Regina Intermodal"   },
+  ],
+  demands: [
+    { id: "Calgary",      label: "Calgary",       demand: 40 },
+    { id: "Edmonton",     label: "Edmonton",      demand: 30 },
+    { id: "Saskatoon",    label: "Saskatoon",     demand: 20 },
+    { id: "ReginaCity",   label: "Regina (City)", demand: 10 },
+  ],
+  arcs: [
+    // Supply → Hubs
+    { u: "PortVancouver",    v: "WinnipegIC", cost: 5 },
+    { u: "PortVancouver",    v: "ReginaIC",   cost: 6 },
+    { u: "PrinceRupertPort", v: "ReginaIC",   cost: 5 },
+    { u: "PrinceRupertPort", v: "WinnipegIC", cost: 6 },
+
+    // Hubs → Demand
+    { u: "WinnipegIC", v: "Calgary",    cost: 3 },
+    { u: "WinnipegIC", v: "Edmonton",   cost: 4 },
+    { u: "WinnipegIC", v: "Saskatoon",  cost: 3 },
+
+    { u: "ReginaIC",   v: "Calgary",    cost: 4 },
+    { u: "ReginaIC",   v: "Saskatoon",  cost: 1 },
+    { u: "ReginaIC",   v: "ReginaCity", cost: 1 },
+  ],
+};
+
+// TP & TS preset lists (for the dropdown)
+const tpPresets = [tpAlbertaGrocers, tpWestPortsPrairies];
+const tsPresets = [tsAlbertaHubs, tsWesternIntermodal];
+
+
+
 /* === Calgary VRP Presets (6) === */
 const vrpPresets = [
 {
@@ -469,9 +749,12 @@ function findScenarioById(id) {
     ([...scenarios, ...spCalgaryPresets].find(s => s.id === id)) ||
     (tspPresets.find(s => s.id === id)) ||
     (vrpPresets.find(s => s.id === id)) ||
+    (tpPresets.find(s => s.id === id)) ||
+    (tsPresets.find(s => s.id === id)) ||
     null
   );
 }
+
 
 
 // -----------------------------
@@ -578,19 +861,21 @@ async function dbLoadCurrentRoundRow(room) {
 
 async function saveRoomRound(room, round) {
   const key = `scma_round_${room}`;
-
-  if (!round) {
-    localStorage.removeItem(key);
-    await dbSaveRound(room, null);
-    return;
+  try {
+    if (!round) {
+      localStorage.removeItem(key);
+      await dbSaveRound(room, null);
+      return;
+    }
+    const row = await dbSaveRound(room, round);
+    const merged = row?.id ? { ...round, id: row.id } : round;
+    localStorage.setItem(key, JSON.stringify(merged));
+  } catch (err) {
+    // Fallback to local only (useful when DB schema doesn’t accept TP/TS yet)
+    if (round) localStorage.setItem(key, JSON.stringify(round));
   }
-
-  // Save to DB and merge back the id if DB returns it
-  const row = await dbSaveRound(room, round);
-  const merged = row?.id ? { ...round, id: row.id } : round;
-
-  localStorage.setItem(key, JSON.stringify(merged));
 }
+
 
 async function loadSeason(room) {
   // returns { totals: {name: points}, history: [] } (adapted for your UI)
@@ -785,6 +1070,10 @@ function InstructorPanel({ room }) {
   // ===== Game mode =====
   const [gameMode, setGameMode] = useState("sp"); // "sp" | "tsp" | "vrp" | "pick"
 
+  // TP/TS chosen preset (for dropdowns)
+const [selTpScenario, setSelTpScenario] = useState("tp-alberta-grocers");
+const [selTsScenario, setSelTsScenario] = useState("ts-alberta-hubs");
+
   // ===== Shortest Path (SP) controls =====
   const [selScenario, setSelScenario] = useState(round?.scenarioId || scenarios[0].id);
   const [customNodes, setCustomNodes] = useState(12);
@@ -805,6 +1094,9 @@ function InstructorPanel({ room }) {
   const [tspNodes, setTspNodes] = useState(10);
   const [selTspScenario, setSelTspScenario] = useState("custom");
   const [selVrpScenario, setSelVrpScenario] = useState("custom");
+
+
+
 
 
   // ===== VRP controls =====
@@ -836,6 +1128,7 @@ function InstructorPanel({ room }) {
 
   // Preview scenario (for SP) or generated nodes (for other modes)
   // Preview scenario (for SP) or generated/preset nodes (for other modes)
+// Preview scenario (SP uses presets/custom; other modes have their own sources)
 const baseScenario =
   gameMode === "sp"
     ? (selScenario === "custom"
@@ -853,8 +1146,13 @@ const baseScenario =
     ? (selVrpScenario === "custom"
         ? makeVrpScenario(vrpCustomers, vrpCapacity)
         : (vrpPresets.find(x => x.id === (round?.scenarioId || selVrpScenario))))
-    : makePickingScenario(pickRows, pickCols, pickCount);
+    : gameMode === "tp"
+    ? (tpPresets.find(x => x.id === (round?.scenarioId || selTpScenario)))
+    : gameMode === "ts"
+    ? (tsPresets.find(x => x.id === (round?.scenarioId || selTsScenario)))
 
+
+    : makePickingScenario(pickRows, pickCols, pickCount);
 
 
   const onOpen = async () => {
@@ -887,8 +1185,14 @@ const baseScenario =
   } else {
     payload = { scenarioId: selVrpScenario }; // preset; no customScenario
   }
-
+  } else if (gameMode === "tp") {
+  const scn = tpPresets.find(s => s.id === selTpScenario) || tpPresets[0];
+  payload = { scenarioId: scn.id, customScenario: scn };
+} else if (gameMode === "ts") {
+  const scn = tsPresets.find(s => s.id === selTsScenario) || tsPresets[0];
+  payload = { scenarioId: scn.id, customScenario: scn };
   } else {
+  // existing pick payload…
     payload = { scenarioId: "pick", customScenario: makePickingScenario(pickRows, pickCols, pickCount) };
   }
 
@@ -947,11 +1251,14 @@ const baseScenario =
               <div>
                 <label className="block text-xs text-slate-300 mb-1">Game Mode</label>
                 <select value={gameMode} onChange={(e)=>setGameMode(e.target.value)} className="bg-white/10 rounded-xl px-4 py-2.5 w-full">
-                  <option value="sp">Shortest Path</option>
-                  <option value="tsp">TSP (visit all + return)</option>
-                  <option value="vrp">VRP (capacity)</option>
-                  <option value="pick">Warehouse Order Picking</option>
-                </select>
+                <option value="tp">Transportation (cost minimization)</option>
+                <option value="ts">Transshipment (hubs)</option>
+                <option value="sp">Shortest Path</option>
+                <option value="tsp">TSP (visit all + return)</option>
+                <option value="vrp">VRP (capacity)</option>
+                <option value="pick">Warehouse Order Picking</option>
+              </select>
+
               </div>
               <div>
                 <label className="block text-xs text-slate-300 mb-1">Countdown (seconds)</label>
@@ -1050,6 +1357,34 @@ const baseScenario =
 
               </>
             )}
+            {gameMode === "tp" && (
+  <label className="flex items-center gap-2">
+    <span className="text-xs text-slate-300">TP Scenario</span>
+    <select
+      className="bg-white/10 rounded-xl px-4 py-2.5"
+      value={selTpScenario}
+      onChange={(e) => setSelTpScenario(e.target.value)}
+    >
+      {tpPresets.map(s => <option key={s.id} value={s.id}>{s.title}</option>)}
+    </select>
+  </label>
+              )}
+
+              {gameMode === "ts" && (
+                <label className="flex items-center gap-2">
+                  <span className="text-xs text-slate-300">TS Scenario</span>
+                  <select
+                    className="bg-white/10 rounded-xl px-4 py-2.5"
+                    value={selTsScenario}
+                    onChange={(e) => setSelTsScenario(e.target.value)}
+                  >
+                    {tsPresets.map(s => <option key={s.id} value={s.id}>{s.title}</option>)}
+                  </select>
+                </label>
+              )}
+
+
+
 
             {gameMode === "tsp" && (
   <div className="grid md:grid-cols-3 gap-4">
@@ -1518,12 +1853,179 @@ function LivePreviewCard({ round, baseScenario }) {
     </div>
   );
 }
+// ===== Cost map for Transportation (TP): one S→D heatmap =====
+function TpCostHeatmap({ scenario }) {
+  const S = scenario?.supplies || [];
+  const D = scenario?.demands || [];
+  const all = [];
+  for (const s of S) for (const d of D) {
+    const key = `${s.id}>${d.id}`;
+    const c = scenario?.cost?.[key];
+    if (c != null) all.push(Number(c));
+  }
+  const min = all.length ? Math.min(...all) : 0;
+  const max = all.length ? Math.max(...all) : 1;
+  const shade = (c) => {
+    if (c == null) return "rgba(255,255,255,0.03)";
+    const t = (Number(c) - min) / (max - min || 1);
+    const light = 90 - Math.round(t * 60); // 90 → 30
+    return `hsl(200 60% ${light}%)`;
+  };
 
-function MapPreview({ scenario }) { return (
-  <div className="overflow-hidden rounded-xl bg-black/20 border border-white/10">
-    <SvgMap scenario={scenario} readonly />
-  </div>
-); }
+  if (!S.length || !D.length) return null;
+  return (
+    <div className="rounded-lg border border-white/10 overflow-auto">
+      <div className="px-2 py-1 text-xs font-semibold bg-white/5">Per-unit cost (Supply → Demand)</div>
+      <table className="min-w-[520px] text-sm">
+        <thead>
+          <tr>
+            <th className="text-left px-2 py-1"></th>
+            {D.map(d => <th key={d.id} className="text-left px-2 py-1">{d.label || d.id}</th>)}
+          </tr>
+        </thead>
+        <tbody>
+          {S.map(s => (
+            <tr key={s.id}>
+              <td className="px-2 py-1 font-medium">{s.label || s.id}</td>
+              {D.map(d => {
+                const key = `${s.id}>${d.id}`;
+                const c = scenario?.cost?.[key];
+                return (
+                  <td key={d.id} className="px-2 py-1 text-center" style={{ background: shade(c) }}>
+                    {c != null ? Number(c) : "—"}
+                  </td>
+                );
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ===== Cost maps for Transshipment (TS): Supply→Hubs and Hubs→Demand =====
+function TsCostTables({ scenario }) {
+  const S = scenario?.supplies || [];
+  const H = scenario?.hubs || [];
+  const D = scenario?.demands || [];
+  const arcCost = new Map((scenario?.arcs || []).map(a => [`${a.u}>${a.v}`, Number(a.cost)]));
+  const collectCosts = (fromList, toList) => {
+    const vals = [];
+    for (const u of fromList) for (const v of toList) {
+      const c = arcCost.get(`${u.id}>${v.id}`);
+      if (c != null) vals.push(c);
+    }
+    return vals;
+  };
+  const all = [...collectCosts(S, H), ...collectCosts(H, D)];
+  const min = all.length ? Math.min(...all) : 0;
+  const max = all.length ? Math.max(...all) : 1;
+  const shade = (c) => c == null ? "rgba(255,255,255,0.03)"
+                                 : `hsl(260 60% ${90 - Math.round(((c - min) / (max - min || 1)) * 60)}%)`;
+
+  if (!S.length || !H.length || !D.length) return null;
+
+  return (
+    <div className="space-y-3">
+      <div className="rounded-lg border border-white/10 overflow-auto">
+        <div className="px-2 py-1 text-xs font-semibold bg-white/5">Per-unit cost (Supply → Hubs)</div>
+        <table className="min-w-[520px] text-sm">
+          <thead>
+            <tr>
+              <th className="px-2 py-1"></th>
+              {H.map(h => <th key={h.id} className="px-2 py-1 text-left">{h.label || h.id}</th>)}
+            </tr>
+          </thead>
+          <tbody>
+            {S.map(s => (
+              <tr key={s.id}>
+                <td className="px-2 py-1 font-medium">{s.label || s.id}</td>
+                {H.map(h => {
+                  const c = arcCost.get(`${s.id}>${h.id}`);
+                  return <td key={h.id} className="px-2 py-1 text-center" style={{ background: shade(c) }}>{c != null ? c : "—"}</td>;
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="rounded-lg border border-white/10 overflow-auto">
+        <div className="px-2 py-1 text-xs font-semibold bg-white/5">Per-unit cost (Hubs → Demand)</div>
+        <table className="min-w-[520px] text-sm">
+          <thead>
+            <tr>
+              <th className="px-2 py-1"></th>
+              {D.map(d => <th key={d.id} className="px-2 py-1 text-left">{d.label || d.id}</th>)}
+            </tr>
+          </thead>
+          <tbody>
+            {H.map(h => (
+              <tr key={h.id}>
+                <td className="px-2 py-1 font-medium">{h.label || h.id}</td>
+                {D.map(d => {
+                  const c = arcCost.get(`${h.id}>${d.id}`);
+                  return <td key={d.id} className="px-2 py-1 text-center" style={{ background: shade(c) }}>{c != null ? c : "—"}</td>;
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function MapPreview({ scenario }) {
+  const hasGraph = Array.isArray(scenario?.nodes) && scenario.nodes.length > 0;
+  if (!hasGraph) {
+    const isTP = Array.isArray(scenario?.supplies) && Array.isArray(scenario?.demands) && scenario?.cost;
+    const isTS = Array.isArray(scenario?.supplies) && Array.isArray(scenario?.hubs) && Array.isArray(scenario?.demands) && Array.isArray(scenario?.arcs);
+
+    return (
+      <div className="p-4 text-sm space-y-3">
+        <div>
+          <div className="font-semibold mb-2">{scenario?.title || "Scenario"}</div>
+          {scenario?.supplies && (
+            <div className="mb-2">
+              <div className="font-medium">Supplies</div>
+              <ul className="list-disc ml-5">
+                {scenario.supplies.map(s => <li key={s.id}>{(s.label||s.id)}: {s.supply}</li>)}
+              </ul>
+            </div>
+          )}
+          {scenario?.hubs?.length > 0 && (
+            <div className="mb-2">
+              <div className="font-medium">Hubs</div>
+              <ul className="list-disc ml-5">
+                {scenario.hubs.map(h => <li key={h.id}>{h.label||h.id}</li>)}
+              </ul>
+            </div>
+          )}
+          {scenario?.demands && (
+            <div className="mb-2">
+              <div className="font-medium">Demands</div>
+              <ul className="list-disc ml-5">
+                {scenario.demands.map(d => <li key={d.id}>{(d.label||d.id)}: {d.demand}</li>)}
+              </ul>
+            </div>
+          )}
+        </div>
+
+        {isTP && <TpCostHeatmap scenario={scenario} />}
+        {isTS && <TsCostTables scenario={scenario} />}
+      </div>
+    );
+  }
+  return (
+    <div className="overflow-hidden rounded-xl bg-black/20 border border-white/10">
+      <SvgMap scenario={scenario} readonly />
+    </div>
+  );
+}
+
+
 
 // -----------------------------
 // Player Panel
@@ -1587,22 +2089,29 @@ function RoundLeaderboardCard({ room, round }) {
   const entries = Object.entries(round.players || {}).map(([name, r]) => ({ name, ...r }));
   entries.sort((a, b) => b.score - a.score || a.timeSec - b.timeSec);
 
-    const { graphEdges } = useWeightedScenario(s, round);
+  const sNorm = s && Array.isArray(s.nodes) ? s : { ...s, nodes: [], edges: [] };
+  const { graphEdges } = useWeightedScenario(sNorm, round);
+
 
   const opt = useMemo(() => {
-  if (!s?.nodes?.length) return { cost: Infinity, path: [] };
   switch (round.gameMode) {
     case "sp":
-      return dijkstra(s.nodes, graphEdges, s.start, s.end);         // already optimal
+      if (!s?.nodes?.length) return { cost: Infinity, path: [] };
+      return dijkstra(s.nodes, graphEdges, s.start, s.end);
     case "tsp":
-      return tspOptimalCost(s.nodes);                                // 🔁 exact small, baseline otherwise
+      return tspOptimalCost(s.nodes || []);
     case "vrp":
-      return vrpOptimalCost(s);                                      // 🔁 exact small, heuristic otherwise
+      return vrpOptimalCost(s);
+    case "tp":
+      return { path: [], cost: tpOptimalCost(s).cost };
+    case "ts":
+      return { path: [], cost: tsOptimalCost(s).cost };
     case "pick":
     default:
-      return pickOptimalCost(s);                                     // 🔁 exact small, baseline otherwise
+      return pickOptimalCost(s);
   }
 }, [round.gameMode, s, graphEdges]);
+
 
 
   const objLabel = round.objectiveMode === "dual"
@@ -1615,8 +2124,12 @@ function RoundLeaderboardCard({ room, round }) {
       <h2 className="text-xl font-bold mb-1">This Round — Room {room}</h2>
       <div className="text-xs text-slate-300">Scenario: {s.title}</div>
       <div className="text-xs text-slate-300 mb-4">
-  Optimal: {formatPathLabels(s, opt.path, "→")} • {objLabel}: {fmt(opt.cost)}
+  {round.gameMode === "tp" || round.gameMode === "ts"
+    ? <>Optimal cost: {fmt(opt.cost)}</>
+    : <>Optimal: {formatPathLabels(s, opt.path, "→")} • {objLabel}: {fmt(opt.cost)}</>
+  }
 </div>
+
 
       <div className="space-y-2">
         {entries.length === 0 && <div className="text-slate-400">No submissions this round.</div>}
@@ -1693,30 +2206,41 @@ useEffect(() => {
     return () => { alive = false; };
   }, [histOpen, room]);
 
-  // Helper: reconstruct scenario from a round row payload
-  function scenarioFromPayload(payload) {
+function scenarioFromPayload(payload) {
   if (!payload) return null;
-  if (payload?.customScenario?.nodes?.length) return payload.customScenario;
+  // TP/TS: accept customScenario even without nodes
+  if (payload?.customScenario) return payload.customScenario;
   const s = findScenarioById(payload?.scenarioId);
   return s || null;
 }
 
 
+
   // Helper: compute optimal for a past round (supports all modes)
- function computeOptimalForPayload(scenario, payload) {
-  if (!scenario?.nodes?.length) return { path: [], cost: Infinity };
+// Helper: compute optimal for a past round (supports all modes incl. TP/TS)
+function computeOptimalForPayload(scenario, payload) {
+  if (!scenario) return { path: [], cost: Infinity };
   const mode = payload?.gameMode || "sp";
   if (mode === "sp") {
+    if (!scenario?.nodes?.length) return { path: [], cost: Infinity };
     const edges = buildGraphEdges(scenario, payload);
     return dijkstra(scenario.nodes, edges, scenario.start, scenario.end);
   } else if (mode === "tsp") {
     return tspOptimalCost(scenario.nodes);
   } else if (mode === "vrp") {
     return vrpOptimalCost(scenario);
+  } else if (mode === "tp") {
+    const { cost } = tpOptimalCost(scenario);
+    return { path: [], cost };
+  } else if (mode === "ts") {
+    const { cost } = tsOptimalCost(scenario);
+    return { path: [], cost };
   } else {
     return pickOptimalCost(scenario);
   }
 }
+
+
 
 
   // Helper: recompute a player's path cost for a past round
@@ -1992,6 +2516,12 @@ function Medal({ rank }) { const m = rank === 1 ? "🥇" : rank === 2 ? "🥈" :
 function PlayCard({ me, round, onRoundUpdate }) {
   const [submitted, setSubmitted] = useState(Boolean(round.players?.[me.name]));
   const [elapsed, setElapsed] = useState(0);
+  // TP/TS student entry state
+  const [shipments, setShipments] = useState({});
+  const [liveCost, setLiveCost] = useState(null);
+  const [liveFeasible, setLiveFeasible] = useState(true);
+  const [violations, setViolations] = useState([]);
+
 
   const scenario = getScenarioFromRound(round);
 
@@ -2002,9 +2532,11 @@ function PlayCard({ me, round, onRoundUpdate }) {
   }, [round.startedAt]);
   const timeLeft = round.endsAt ? Math.max(0, Math.ceil((round.endsAt - Date.now()) / 1000)) : null;
 
-  // graph (SP) — hooks top-level only
-  const { graphEdges, optCost: spOptCost } = useWeightedScenario(scenario, round);
-  const spAdj = useMemo(() => new Set(graphEdges.map(([u, v]) => `${u}>${v}`)), [graphEdges]);
+  // graph (SP) — make safe for TP/TS (no nodes)
+const sNorm = scenario && Array.isArray(scenario.nodes) ? scenario : { ...scenario, nodes: [], edges: [] };
+const { graphEdges, optCost: spOptCost } = useWeightedScenario(sNorm, round);
+const spAdj = useMemo(() => new Set(graphEdges.map(([u, v]) => `${u}>${v}`)), [graphEdges]);
+
 
   const [path, setPath] = useState([scenario.start || "S"]);
   const currentNode = path[path.length - 1];
@@ -2051,29 +2583,44 @@ function PlayCard({ me, round, onRoundUpdate }) {
   // totals + submit rules per mode
   let totalCost = 0, canSubmit = false, objectiveText = "";
 
-  if (round.gameMode === "sp") {
-    totalCost = spPathCost;
-    objectiveText = round.objectiveMode === "dual"
-      ? `minimize α·${round.objA.toUpperCase()} + (1−α)·${round.objB.toUpperCase()}`
-      : `minimize ${(round.objA || scenario.objective).toUpperCase()}`;
-    canSubmit = currentNode === scenario.end && path.length > 1 &&
-                round.isOpen && (!round.endsAt || Date.now() < round.endsAt);
-  } else if (round.gameMode === "tsp") {
-    totalCost = legsTsp.reduce((a, L) => a + L.dist, 0);
-    objectiveText = "TSP: visit all nodes, return to S (Euclidean)";
-    canSubmit = round.isOpen && (!round.endsAt || Date.now() < round.endsAt) &&
-      tspIsComplete(path, scenario.nodes);
-  } else if (round.gameMode === "vrp") {
-    totalCost = legsVrp.reduce((a, L) => a + L.dist, 0);
-    objectiveText = `VRP: serve all customers, cap=${scenario.capacity} (Euclidean)`;
-    canSubmit = round.isOpen && (!round.endsAt || Date.now() < round.endsAt) &&
-      vrpAllCustomersSelected(path, scenario);
-  } else {
-    totalCost = legsPick.reduce((a, L) => a + L.dist, 0);
-    objectiveText = "Order Picking: visit all picks and return to S (Manhattan)";
-    canSubmit = round.isOpen && (!round.endsAt || Date.now() < round.endsAt) &&
-      pickIsComplete(path, scenario);
-  }
+if (round.gameMode === "sp") {
+  totalCost = spPathCost;
+  objectiveText = round.objectiveMode === "dual"
+    ? `minimize α·${round.objA.toUpperCase()} + (1−α)·${round.objB.toUpperCase()}`
+    : `minimize ${(round.objA || scenario.objective).toUpperCase()}`;
+  canSubmit = currentNode === scenario.end && path.length > 1 &&
+              round.isOpen && (!round.endsAt || Date.now() < round.endsAt);
+} else if (round.gameMode === "tsp") {
+  totalCost = legsTsp.reduce((a, L) => a + L.dist, 0);
+  objectiveText = "TSP: visit all nodes, return to S (Euclidean)";
+  canSubmit = round.isOpen && (!round.endsAt || Date.now() < round.endsAt) &&
+    tspIsComplete(path, scenario.nodes);
+} else if (round.gameMode === "vrp") {
+  totalCost = legsVrp.reduce((a, L) => a + L.dist, 0);
+  objectiveText = `VRP: serve all customers, cap=${scenario.capacity} (Euclidean)`;
+  canSubmit = round.isOpen && (!round.endsAt || Date.now() < round.endsAt) &&
+    vrpAllCustomersSelected(path, scenario);
+} else if (round.gameMode === "tp") {
+  const ev = tpEvaluate(scenario, shipments);
+  totalCost = ev.totalCost;
+  objectiveText = "Transportation: satisfy all supply/demand at minimum cost";
+  canSubmit = round.isOpen && (!round.endsAt || Date.now() < round.endsAt) && ev.feasible;
+} else if (round.gameMode === "ts") {
+  // basic: allow submit; scoring will compare to optimal
+  totalCost = Object.entries(shipments || {}).reduce((sum,[k,q]) => {
+    const arc = (scenario.arcs||[]).find(a => `${a.u}>${a.v}` === k);
+    return sum + (Number(q)||0) * (arc ? Number(arc.cost||0) : 0);
+  }, 0);
+  objectiveText = "Transshipment: send via allowed hubs to meet demand";
+  canSubmit = round.isOpen && (!round.endsAt || Date.now() < round.endsAt);
+} else {
+  // Order Picking (default)
+  totalCost = legsPick.reduce((a, L) => a + L.dist, 0);
+  objectiveText = "Order Picking: visit all picks and return to S (Manhattan)";
+  canSubmit = round.isOpen && (!round.endsAt || Date.now() < round.endsAt) &&
+    pickIsComplete(path, scenario);
+}
+
 
   // Click rules
   const allowedMove = (u, v) => {
@@ -2112,39 +2659,69 @@ function PlayCard({ me, round, onRoundUpdate }) {
 
   // Baselines for scoring
   const optCost =
-    round.gameMode === "sp" ? spOptCost :
-    round.gameMode === "tsp" ? tspBaselineCost(scenario.nodes).cost :
-    round.gameMode === "vrp" ? vrpBaselineCost(scenario).cost :
-    pickBaselineCost(scenario).cost;
+  round.gameMode === "sp" ? spOptCost :
+  round.gameMode === "tsp" ? tspBaselineCost(scenario.nodes).cost :
+  round.gameMode === "vrp" ? vrpBaselineCost(scenario).cost :
+  round.gameMode === "tp" ? tpOptimalCost(scenario).cost :
+  round.gameMode === "ts" ? tsOptimalCost(scenario).cost :
+  pickBaselineCost(scenario).cost;
 
-  const onSubmit = async () => {
-  if (!canSubmit || submitted) return;
-  const timeSec = elapsed;
-  const base = Math.max(1, Math.round(1000 * (optCost / Math.max(1, totalCost))));
-  const timeBonus = Math.max(0, 200 - timeSec);
-  const score = base + timeBonus;
-const r = (await loadRoomRound(round.room || "SCMA")) || round;
-  r.players = r.players || {};
-  r.players[me.name] = { cost: Math.round(totalCost), timeSec, score, path };
+async function onSubmit() {
+  if (!round || !me) return;
+  const timeSec = Math.max(0, Math.round((Date.now() - (round.startedAt || Date.now())) / 1000));
 
-  // 🔐 Make sure we have a DB round id
-  let rid = round.id;
-  if (!rid) {
-    const cur = await dbLoadCurrentRoundRow(me.room);
-    rid = cur?.id || null;
-  }
-
-  if (rid) {
-    await dbUpsertSubmission(rid, me.name, { cost: Math.round(totalCost), timeSec, score, path });
+  let myCost;
+  if (round.gameMode === "sp") {
+    myCost = Math.round(spPathCost || 0);
+  } else if (round.gameMode === "tsp") {
+    myCost = Math.round(legsTsp.reduce((a,L)=>a+L.dist,0));
+  } else if (round.gameMode === "vrp") {
+    myCost = Math.round(legsVrp.reduce((a,L)=>a+L.dist,0));
+  } else if (round.gameMode === "tp") {
+    const ev = tpEvaluate(scenario, shipments);
+    if (!ev.feasible) {
+      alert("Please fix feasibility issues before submitting:\n" + ev.violations.join("\n"));
+      return;
+    }
+    myCost = Math.round(ev.totalCost);
+  } else if (round.gameMode === "ts") {
+    const allowed = new Set((scenario?.arcs||[]).map(a => `${a.u}>${a.v}`));
+    let enteredCost = 0;
+    for (const [k,q] of Object.entries(shipments||{})) {
+      if (!allowed.has(k)) continue;
+      const arc = scenario.arcs.find(a => `${a.u}>${a.v}` === k);
+      if (!arc) continue;
+      enteredCost += Number(q||0) * Number(arc.cost||0);
+    }
+    myCost = Math.round(enteredCost);
   } else {
-    console.warn("No DB round id yet; submission stored only in local payload.");
+    myCost = Math.round(legsPick.reduce((a,L)=>a+L.dist,0));
   }
 
-  await saveRoomRound(me.room, r);
-  onRoundUpdate({ ...r, id: rid || r.id }); // keep id in state if we got it
-  setSubmitted(true);
+  // Optimal for scoring
+  let optCostVal;
+  if (round.gameMode === "tp")       optCostVal = tpOptimalCost(scenario).cost;
+  else if (round.gameMode === "ts")  optCostVal = tsOptimalCost(scenario).cost;
+  else if (round.gameMode === "sp")  optCostVal = spOptCost;
+  else if (round.gameMode === "tsp") optCostVal = tspOptimalCost(scenario.nodes).cost;
+  else if (round.gameMode === "vrp") optCostVal = vrpOptimalCost(scenario).cost;
+  else                               optCostVal = pickOptimalCost(scenario).cost;
 
-};
+  const score = (Number.isFinite(optCostVal) && optCostVal > 0)
+    ? Math.max(0, Math.round(1000 * (optCostVal / Math.max(myCost, optCostVal)) ))
+    : 0;
+
+  const r = { ...round, players: { ...(round.players||{}) } };
+  if (round.gameMode === "tp" || round.gameMode === "ts") {
+    r.players[me.name] = { cost: myCost, timeSec, score, shipments: { ...(shipments||{}) } };
+  } else {
+    r.players[me.name] = { cost: myCost, timeSec, score, path: [...path] };
+  }
+  await saveRoomRound(me.room, r);
+  onRoundUpdate(r);
+}
+
+
 
 
   // Which leg list to show
@@ -2172,15 +2749,19 @@ const r = (await loadRoomRound(round.room || "SCMA")) || round;
         </div>
 
         <div className="overflow-hidden rounded-xl bg-black/20 border border-white/10">
-          <SvgMap
-            scenario={scenario}
-            round={round}               // ← NEW: use the selected objective / α for labels
-            path={path}
-            onClickNode={onClickNode}
-            hintLines={round.gameMode === "tsp" ? tspHintLines : []}
-          />
-
+          {Array.isArray(scenario?.nodes) && scenario.nodes.length > 0 ? (
+            <SvgMap
+              scenario={scenario}
+              round={round}
+              path={path}
+              onClickNode={onClickNode}
+              hintLines={round.gameMode === "tsp" ? tspHintLines : []}
+            />
+          ) : (
+            <MapPreview scenario={scenario} />
+          )}
         </div>
+
 
         {/* Numbers & legs */}
         <div className="mt-4 grid md:grid-cols-2 gap-3">
@@ -2221,6 +2802,39 @@ const r = (await loadRoomRound(round.room || "SCMA")) || round;
             </div>
           </div>
         )}
+
+       {round.gameMode === "tp" && (
+  <div className="mt-4 space-y-3">
+    <TpCostHeatmap scenario={scenario} />
+    <TransportMatrix
+      scenario={scenario}
+      value={shipments}
+      onChange={(v)=> {
+        setShipments(v);
+        const ev = tpEvaluate(scenario, v);
+        setLiveCost(ev.totalCost);
+        setLiveFeasible(ev.feasible);
+        setViolations(ev.violations||[]);
+      }}
+    />
+    <div className="text-sm">
+      <div>Total cost: <span className="font-semibold">${Math.round(liveCost||0)}</span></div>
+      {!liveFeasible && <div className="text-amber-300 mt-1">Fix: {violations.join(" • ")}</div>}
+    </div>
+  </div>
+)}
+
+{round.gameMode === "ts" && (
+  <div className="mt-4 space-y-3">
+    <TsCostTables scenario={scenario} />
+    <TransshipMatrices
+      scenario={scenario}
+      value={shipments}
+      onChange={(v)=> setShipments(v)}
+    />
+  </div>
+)}
+
 
         {/* Leg list for all non-SP modes */}
         {legList.length > 0 && round.gameMode !== "tsp" && (
@@ -2579,10 +3193,13 @@ function useRound(room) {
 
 function getScenarioFromRound(round) {
   if (!round) return null;
-  if (round.customScenario?.nodes?.length) return round.customScenario;
+  // TP/TS have no nodes — accept any customScenario object
+  if (round.customScenario) return round.customScenario;
   const s = findScenarioById(round.scenarioId);
   return s ?? null;
 }
+
+
 
 
 
@@ -3596,4 +4213,93 @@ function vrpOptimalCost(scenario) {
     else flat.push(...r);
   }
   return { cost: dp[full], path: flat };
+}
+// ========== Simple matrix input for Transportation ==========
+function TransportMatrix({ scenario, value, onChange }) {
+  const S = scenario?.supplies||[], D = scenario?.demands||[];
+  const get = (s,d) => value?.[`${s.id}>${d.id}`] ?? "";
+  const set = (s,d,q) => onChange({ ...(value||{}), [`${s.id}>${d.id}`]: q });
+
+  return (
+    <div className="overflow-auto">
+      <table className="min-w-[520px] text-sm">
+        <thead>
+          <tr><th></th>{D.map(d=> <th key={d.id}>{d.label||d.id}<div className="text-xs opacity-70">demand={d.demand}</div></th>)}</tr>
+        </thead>
+        <tbody>
+          {S.map(s=>(
+            <tr key={s.id}>
+              <td className="pr-2 font-medium">{s.label||s.id}<div className="text-xs opacity-70">supply={s.supply}</div></td>
+              {D.map(d=>(
+                <td key={d.id} className="p-1">
+                  <input
+                    type="number" min="0"
+                    className="w-24 bg-white/10 rounded px-2 py-1"
+                    value={get(s,d)}
+                    onChange={e=> set(s,d, Number(e.target.value||0))}
+                  />
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ========== Simple 2-matrix input for Transshipment ==========
+function TransshipMatrices({ scenario, value, onChange }) {
+  const S = scenario?.supplies||[], H = scenario?.hubs||[], D = scenario?.demands||[];
+  const allowed = new Set((scenario?.arcs||[]).map(a => `${a.u}>${a.v}`));
+  const get = (u,v) => value?.[`${u}>${v}`] ?? "";
+  const set = (u,v,q) => onChange({ ...(value||{}), [`${u}>${v}`]: q });
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <div className="font-semibold mb-1">Supply → Hubs</div>
+        <table className="min-w-[520px] text-sm">
+          <thead><tr><th></th>{H.map(h=> <th key={h.id}>{h.label||h.id}</th>)}</tr></thead>
+          <tbody>
+            {S.map(s=>(
+              <tr key={s.id}>
+                <td className="pr-2 font-medium">{s.label||s.id}<div className="text-xs opacity-70">supply={s.supply}</div></td>
+                {H.map(h=>(
+                  <td key={h.id} className="p-1">
+                    {allowed.has(`${s.id}>${h.id}`) ? (
+                      <input type="number" min="0" className="w-24 bg-white/10 rounded px-2 py-1"
+                        value={get(s.id,h.id)} onChange={e=> set(s.id,h.id, Number(e.target.value||0))}/>
+                    ) : <div className="opacity-30">—</div>}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div>
+        <div className="font-semibold mb-1">Hubs → Demand</div>
+        <table className="min-w-[520px] text-sm">
+          <thead><tr><th></th>{D.map(d=> <th key={d.id}>{d.label||d.id}<div className="text-xs opacity-70">demand={d.demand}</div></th>)}</tr></thead>
+          <tbody>
+            {H.map(h=>(
+              <tr key={h.id}>
+                <td className="pr-2 font-medium">{h.label||h.id}</td>
+                {D.map(d=>(
+                  <td key={d.id} className="p-1">
+                    {allowed.has(`${h.id}>${d.id}`) ? (
+                      <input type="number" min="0" className="w-24 bg-white/10 rounded px-2 py-1"
+                        value={get(h.id,d.id)} onChange={e=> set(h.id,d.id, Number(e.target.value||0))}/>
+                    ) : <div className="opacity-30">—</div>}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
 }
