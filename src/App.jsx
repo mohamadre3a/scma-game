@@ -2939,9 +2939,20 @@ const nodeById = Object.fromEntries(vnodes.map(n => [n.id, n]));
   // Highlight edges from player's path (SP)
   const selected = new Set();
   for (let i = 0; i < path.length - 1; i++) selected.add(path[i] + ">" + path[i + 1]);
+  // For arrowheads: know if an edge has its reverse → treat as bidirectional
+  const pairSet = new Set(edges.map(([u, v]) => `${u}>${v}`));
 
   return (
     <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-[360px] md:h-[640px]">
+      <defs>
+        <marker id="arrowhead"
+                viewBox="0 0 10 10"
+                refX="9" refY="5"
+                markerWidth="6" markerHeight="6"
+                orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="context-stroke" />
+        </marker>
+      </defs>
       {/* base edges (SP) */}
       {edges.map(([u, v, w, m], idx) => {
         const a = nodeById[u], b = nodeById[v];
@@ -2952,8 +2963,23 @@ const nodeById = Object.fromEntries(vnodes.map(n => [n.id, n]));
         const showVal = (typeof w === "number") ? w : (w?.[scenario.objective] ?? w?.time ?? 0);
         return (
           <g key={`e${idx}`}>
-            <line x1={a.x} y1={a.y} x2={b.x} y2={b.y}
-                  stroke={sel ? "#34d399" : "#94a3b8"} strokeWidth={sel ? 7 : 4} strokeOpacity={0.9} strokeLinecap="round" />
+                        {(() => {
+              const hasRev = pairSet.has(`${v}>${u}`);
+              return (
+                <line
+                  x1={a.x} y1={a.y} x2={b.x} y2={b.y}
+                  stroke={sel ? "#34d399" : "#94a3b8"}
+                  strokeWidth={sel ? 7 : 4}
+                  strokeOpacity={0.9}
+                  strokeLinecap="round"
+                  {...(hasRev
+                    ? { markerStart: "url(#arrowhead)", markerEnd: "url(#arrowhead)" } // ↔ bidirectional
+                    : { markerEnd: "url(#arrowhead)" }                                // → one-way u→v
+                  )}
+                />
+              );
+            })()}
+
             <EdgeLabel a={a} b={b} text={`${m || ""} ${showVal}`} />
           </g>
         );
