@@ -2088,6 +2088,17 @@ function RoundLeaderboardCard({ room, round }) {
   const s = getScenarioFromRound(round);
   const entries = Object.entries(round.players || {}).map(([name, r]) => ({ name, ...r }));
   entries.sort((a, b) => b.score - a.score || a.timeSec - b.timeSec);
+  const ranked = [];
+  let rank = 1, prevScore = null;
+  entries.forEach((e, i) => {
+    if (i === 0) {
+      rank = 1;
+    } else if (e.score !== prevScore) {
+      rank = i + 1; // dense rank by score
+    }
+    ranked.push({ ...e, rank, seasonPts: Math.max(0, 24 - rank) });
+    prevScore = e.score;
+  });
 
   const sNorm = s && Array.isArray(s.nodes) ? s : { ...s, nodes: [], edges: [] };
   const { graphEdges } = useWeightedScenario(sNorm, round);
@@ -2143,7 +2154,7 @@ function RoundLeaderboardCard({ room, round }) {
               </div>
             </div>
             <div className="text-right text-xs">
-              <div>Season points: {Math.max(0, 24 - (i + 1))}</div>
+              <div>Season points: {e.seasonPts}</div>
             </div>
           </div>
         ))}
@@ -2375,7 +2386,12 @@ function costForPayloadPath(scenario, payload, playerPath) {
                 {(() => {
                   const payload = sel?.payload || {};
                   const scenario = scenarioFromPayload(payload);
-                  if (!scenario?.nodes?.length) return <div className="opacity-70">Scenario unavailable.</div>;
+                  const isTpTs = (payload?.gameMode === "tp" || payload?.gameMode === "ts");
+                    if (!isTpTs && !scenario?.nodes?.length) {
+                      return <div className="opacity-70">Scenario unavailable.</div>;
+                    }
+
+
                   
                   const objLabel = payload?.objectiveMode === "dual"
                   ? `${Math.round(100 * (payload?.alpha ?? 0.5))}% ${payload?.objA} + ${Math.round(100 * (1 - (payload?.alpha ?? 0.5)))}% ${payload?.objB}`
@@ -2432,6 +2448,11 @@ function costForPayloadPath(scenario, payload, playerPath) {
                               const name = row.username || row.user || row.name || "Player";
                               const path = Array.isArray(row.path) ? row.path : null;
                               const cost = row.cost ?? (path ? costForPayloadPath(scenario, payload, path) : null);
+                              // pull TP/TS quantities from the round payload
+                              const pr = (payload?.players || {})[name] || {};
+                              const tpShip = pr.shipments || null;  // {"S1>D1": q, ...}
+                              const tsFlow = pr.flows || null;      // {"Hub1>D1": q, ...}
+
                               return (
                                 <li key={row.id}>
                                   <button
@@ -2447,6 +2468,23 @@ function costForPayloadPath(scenario, payload, playerPath) {
                                         path: [{path.join(" → ")}]
                                       </div>
                                     )}
+                                    {row.shipments && (
+                                      <div className="text-[11px] opacity-75 font-mono overflow-hidden text-ellipsis">
+                                        {Object.entries(row.shipments)
+                                          .filter(([_, q]) => Number(q) > 0)
+                                          .map(([k, q]) => `${k}:${q}`)
+                                          .join(", ")}
+                                      </div>
+                                    )}
+                                    {row.flows && !row.shipments && (
+                                      <div className="text-[11px] opacity-75 font-mono overflow-hidden text-ellipsis">
+                                        {Object.entries(row.flows)
+                                          .filter(([_, q]) => Number(q) > 0)
+                                          .map(([k, q]) => `${k}:${q}`)
+                                          .join(", ")}
+                                      </div>
+                                    )}
+
                                   </button>
                                 </li>
                               );
@@ -2713,11 +2751,44 @@ async function onSubmit() {
 
   const r = { ...round, players: { ...(round.players||{}) } };
   if (round.gameMode === "tp" || round.gameMode === "ts") {
-    r.players[me.name] = { cost: myCost, timeSec, score, shipments: { ...(shipments||{}) } };
+    r.players[me.name] = {
+      score,
+      cost: myCost,
+      timeSec,
+      path: round.gameMode === "sp" ? path : null,
+      shipments: round.gameMode === "tp" ? shipments : undefined, // e.g., {"TX→NO":120, ...}
+      flows: round.gameMode === "ts" ? shipments : undefined      // reuse the same object name if you like
+    };
+
+    // r.players[me.name] = { cost: myCost, timeSec, score, shipments: { ...(shipments||{}) } };
   } else {
     r.players[me.name] = { cost: myCost, timeSec, score, path: [...path] };
   }
   await saveRoomRound(me.room, r);
+  // persist per-player row as well
+  // also persist a per-player row so Past Rounds can load players
+try {
+  const cur = await dbLoadCurrentRoundRow(me.room); // { id } of the open round
+  if (cur?.id) {
+    await dbUpsertSubmission(cur.id, me.name, {
+      score,
+      cost: myCost,
+      time_sec: timeSec,
+      // keep path if present; TP/TS won’t have one
+      path: r.players?.[me.name]?.path || null
+      // if your submissions table has JSON columns for TP/TS, you can add:
+      // shipments: r.players?.[me.name]?.shipments || null,
+      // flows:     r.players?.[me.name]?.flows || null,
+    });
+  }
+} catch (e) {
+  console.warn("submissions upsert failed", e);
+}
+
+// reflect UI state
+setSubmitted(true);
+
+
   onRoundUpdate(r);
 }
 
@@ -3977,11 +4048,14 @@ async function dbListPlayerHistory(room, username, limit = 50) {
 
 async function dbApplySeasonPoints(room, standings) {
   // standings = array of { name, rank } sorted by score
-  const rows = standings.map((s) => ({
-    room,
-    username: s.name,
-    points: Math.max(0, 24- s.rank),
-  }));
+  const sorted = [...standings].sort((a,b)=> b.score - a.score || a.timeSec - b.timeSec);
+  let rank = 1, prevScore = null;
+  const rows = sorted.map((s, i) => {
+    if (i === 0) rank = 1;
+    else if (s.score !== prevScore) rank = i + 1;
+    prevScore = s.score;
+    return { room, username: s.name, points: Math.max(0, 24 - rank) };
+  });
   // Upsert by incrementing points
   for (const r of rows) {
     const { data } = await supabase
