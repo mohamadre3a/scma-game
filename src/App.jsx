@@ -483,22 +483,20 @@ function tpOptimalCost(scn) {
 /** Transshipment optimal (supply -> hubs -> demand; arcs define what's allowed). */
 function tsOptimalCost(scn) {
   const nodes = [
-    ...(scn.supplies||[]).map(s=>s.id),
-    ...(scn.hubs||[]).map(h=>h.id),
-    ...(scn.demands||[]).map(d=>d.id),
+    ...(scn.supplies || []).map(s => s.id),
+    ...(scn.hubs || []).map(h => h.id),
+    ...(scn.demands || []).map(d => d.id),
   ];
-  const supplies = Object.fromEntries((scn.supplies||[]).map(s => [s.id, Number(s.supply||0)]));
-  const demands = Object.fromEntries((scn.demands||[]).map(d => [d.id, Number(d.demand||0)]));
-  const arcs = (scn.arcs||[]).map(a => ({u:a.u, v:a.v, cost:Number(a.cost), cap:Number.isFinite(a.cap)?a.cap:Infinity}));
-  // Optional hub caps (throughput): comment out if you don't need.
-  for (const h of (scn.hubs||[])) {
-    if (Number.isFinite(h.cap)) {
-      arcs.push({u:"__SS__", v:h.id, cost:0, cap:h.cap});
-      arcs.push({u:h.id, v:"__TT__", cost:0, cap:h.cap});
-    }
-  }
+  const supplies = Object.fromEntries((scn.supplies || []).map(s => [s.id, Number(s.supply || 0)]));
+  const demands  = Object.fromEntries((scn.demands  || []).map(d => [d.id, Number(d.demand  || 0)]));
+  const arcs = (scn.arcs || []).map(a => ({
+    u: a.u, v: a.v, cost: Number(a.cost),
+    cap: Number.isFinite(a.cap) ? a.cap : Infinity
+  }));
+  // No direct SS→hub or hub→TT arcs. All flow must use allowed arcs only.
   return minCostFlow(nodes, arcs, supplies, demands);
 }
+
 
 
 
@@ -884,6 +882,41 @@ async function loadSeason(room) {
   for (const r of rows) totals[r.username] = r.points;
   return { totals, history: [] };
 }
+
+// --- Day leaderboard (MDT) ---
+const MDT_TZ = "America/Edmonton";
+
+function dateKeyInTZ(date, tz = MDT_TZ) {
+  const y = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric" }).format(date);
+  const m = new Intl.DateTimeFormat("en-CA", { timeZone: tz, month: "2-digit" }).format(date);
+  const d = new Intl.DateTimeFormat("en-CA", { timeZone: tz, day: "2-digit" }).format(date);
+  return `${y}-${m}-${d}`; // e.g., 2025-09-26
+}
+function todayKeyMDT() { return dateKeyInTZ(new Date(), MDT_TZ); }
+
+async function loadDayTotals(room) {
+  const today = todayKeyMDT();
+  // Get recent closed rounds for this room
+  const rounds = await dbListPastRounds(room, 100);
+  const totals = {};
+  for (const r of rounds) {
+    const started = r.started_at ? new Date(r.started_at) : null;
+    if (!started) continue;
+    const key = dateKeyInTZ(started, MDT_TZ);
+    if (key !== today) continue;               // only today (MDT)
+    const payload = r.payload || {};
+    // Build standings for this round using in-game score + time
+    const standings = computeStandings(payload);
+    for (const s of standings) {
+      totals[s.name] = (totals[s.name] || 0) + Math.max(0, 24 - s.rank);
+    }
+  }
+  // Convert to [{name, pts}] sorted desc
+  return Object.entries(totals)
+    .map(([name, pts]) => ({ name, pts }))
+    .sort((a, b) => b.pts - a.pts || a.name.localeCompare(b.name));
+}
+
 
 function saveSeason(room, season) { const s = loadStore(); s["season:" + room] = season; saveStore(s); }
 
@@ -2166,6 +2199,18 @@ function RoundLeaderboardCard({ room, round }) {
 
 function SeasonLeaderboardCard({ room, season }) {
   // season totals (existing)
+    const [boardTab, setBoardTab] = useState("season"); // "season" | "day"
+  const [dayTotals, setDayTotals] = useState([]);
+  const todayKey = todayKeyMDT();
+
+  useEffect(() => {
+    if (boardTab !== "day") return;
+    (async () => {
+      const rows = await loadDayTotals(room);
+      setDayTotals(rows);
+    })();
+  }, [room, boardTab, season]);
+
   const totals = Object.entries(season.totals || {}).map(([name, pts]) => ({ name, pts }));
 
   totals.sort((a, b) => b.pts - a.pts || a.name.localeCompare(b.name));
@@ -2296,21 +2341,46 @@ function costForPayloadPath(scenario, payload, playerPath) {
 
   return (
     <div className="rounded-2xl bg-gradient-to-br from-emerald-800/60 to-teal-900/60 p-6 ring-1 ring-white/10 shadow-xl">
-      <h3 className="font-bold mb-2">Season Leaderboard</h3>
-      <div className="text-xs text-emerald-200 mb-3">Cumulative points across all rounds (24 − place, min 0).</div>
+      <div className="flex items-center justify-between mb-2">
+  <div className="flex gap-2">
+    <button
+      className={`px-3 py-1.5 rounded-full text-sm font-semibold ${boardTab === "season" ? "bg-emerald-600" : "bg-white/10 hover:bg-white/20"}`}
+      onClick={() => setBoardTab("season")}
+    >
+      Season
+    </button>
+    <button
+      className={`px-3 py-1.5 rounded-full text-sm font-semibold ${boardTab === "day" ? "bg-emerald-600" : "bg-white/10 hover:bg-white/20"}`}
+      onClick={() => setBoardTab("day")}
+    >
+      Today (MDT)
+    </button>
+  </div>
+  {boardTab === "day" && <div className="text-xs text-emerald-200">Date: {todayKey}</div>}
+</div>
 
-      <div className="space-y-2">
-        {totals.length === 0 && <div className="text-emerald-200/80">No points yet.</div>}
-        {totals.map((e, i) => (
-          <div key={e.name} className={`flex items-center justify-between rounded-xl px-3 py-2 ${i === 0 ? "bg-yellow-500/20" : i === 1 ? "bg-slate-400/20" : i === 2 ? "bg-amber-700/30" : "bg-white/5"}`}>
-            <div className="flex items-center gap-3">
-              <Medal rank={i + 1} />
-              <button className="font-semibold hover:underline" onClick={() => setSelectedPlayer(e.name)}>{e.name}</button>
-            </div>
-            <div className="text-right text-sm font-bold">{e.pts} pts</div>
-          </div>
-        ))}
+<div className="text-xs text-emerald-200 mb-3">
+  {boardTab === "season"
+    ? "Cumulative points across all rounds (24 − place, min 0)."
+    : "Points from all closed rounds that started today (MDT)."}
+</div>
+
+{(boardTab === "season" ? totals : dayTotals).length === 0 && (
+  <div className="text-emerald-200/80">No points yet.</div>
+)}
+
+<div className="space-y-2">
+  {(boardTab === "season" ? totals : dayTotals).map((e, i) => (
+    <div key={e.name} className={`flex items-center justify-between rounded-xl px-3 py-2 ${i === 0 ? "bg-emerald-700/40" : i === 1 ? "bg-emerald-700/25" : i === 2 ? "bg-amber-700/30" : "bg-white/5"}`}>
+      <div className="flex items-center gap-3">
+        <Medal rank={i + 1} />
+        <button className="font-semibold hover:underline underline-offset-2" onClick={() => setSelectedPlayer(e.name)}>{e.name}</button>
       </div>
+      <div className="text-right text-sm font-bold">{e.pts} pts</div>
+    </div>
+  ))}
+</div>
+
 
       <ExportCsvButtonSeason room={room} />
 
@@ -2333,6 +2403,34 @@ function costForPayloadPath(scenario, payload, playerPath) {
     path: [{formatPathLabels(scenarioFromPayload(h.payload), h.path, " → ")}]
   </div>
 )}
+{(() => {
+  const mode = h?.payload?.gameMode;
+  const scn = scenarioFromPayload(h.payload);
+  if (!scn || (mode !== "tp" && mode !== "ts")) return null;
+
+  // Compute optimal flows for this round’s scenario
+  const opt = mode === "tp" ? tpOptimalCost(scn) : tsOptimalCost(scn);
+  const playerMap = mode === "tp" ? (h.shipments || {}) : (h.flows || {});
+  const playerPairs = Object.entries(playerMap).filter(([_, q]) => Number(q) > 0);
+  const optPairs = Object.entries(opt.flows || {}).filter(([_, q]) => Number(q) > 0);
+
+  return (
+    <div className="mt-1 space-y-1">
+      <div className="text-[11px] opacity-75 font-mono">
+        <span className="font-semibold">Player {mode.toUpperCase()}:</span>{" "}
+        {playerPairs.length ? playerPairs.map(([k,q]) => `${k}:${q}`).join(", ") : "—"}
+      </div>
+      <div className="text-[11px] opacity-75 font-mono">
+        <span className="font-semibold">Optimal {mode.toUpperCase()}:</span>{" "}
+        {optPairs.length ? optPairs.map(([k,q]) => `${k}:${q}`).join(", ") : "—"}
+      </div>
+      <div className="text-[11px] opacity-60 font-mono">
+        Optimal cost: {Number.isFinite(opt.cost) ? Number(opt.cost).toFixed(2) : "—"}
+      </div>
+    </div>
+  );
+})()}
+
 
             </div>
             <div className="text-right text-sm">
@@ -2468,17 +2566,18 @@ function costForPayloadPath(scenario, payload, playerPath) {
                                         path: [{path.join(" → ")}]
                                       </div>
                                     )}
-                                    {row.shipments && (
+                                    {tpShip && (
                                       <div className="text-[11px] opacity-75 font-mono overflow-hidden text-ellipsis">
-                                        {Object.entries(row.shipments)
+                                        {Object.entries(tpShip)
                                           .filter(([_, q]) => Number(q) > 0)
                                           .map(([k, q]) => `${k}:${q}`)
                                           .join(", ")}
                                       </div>
                                     )}
-                                    {row.flows && !row.shipments && (
+                                    {tsFlow && !tpShip && (
+
                                       <div className="text-[11px] opacity-75 font-mono overflow-hidden text-ellipsis">
-                                        {Object.entries(row.flows)
+                                        {Object.entries(tsFlow)
                                           .filter(([_, q]) => Number(q) > 0)
                                           .map(([k, q]) => `${k}:${q}`)
                                           .join(", ")}
@@ -4028,15 +4127,23 @@ async function dbListPlayerHistory(room, username, limit = 50) {
       .limit(limit);
 
     if (error) { throw error; }
-    return (data || []).map(r => ({
-      round_id: r.round_id,
-      started_at: r.rounds.started_at,
-      payload: r.rounds.payload,
+    return (data || []).map(r => {
+    const payload = r.rounds.payload || {};
+    const usernameKey = username; // the function arg
+    const perPlayer = (payload.players || {})[usernameKey] || {};
+    return {
+      roundId: r.round_id,
+      startedAt: r.rounds.started_at,
+      payload,
       score: r.score,
       cost: r.cost,
-      time_sec: r.time_sec,
+      timeSec: r.time_sec,
       path: r.path,
-    }));
+      shipments: perPlayer.shipments || null, // TP solutions
+      flows: perPlayer.flows || null,         // TS solutions
+    };
+});
+
   } catch (e) {
     console.error("dbListPlayerHistory error", e);
     return [];
