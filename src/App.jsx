@@ -1128,6 +1128,10 @@ const [selTsScenario, setSelTsScenario] = useState("ts-alberta-hubs");
   const [selTspScenario, setSelTspScenario] = useState("custom");
   const [selVrpScenario, setSelVrpScenario] = useState("custom");
 
+// Shared controls
+const [distMetric, setDistMetric] = useState("euclid"); // "euclid" | "manhattan"
+const [tspOpt, setTspOpt] = useState("nn");             // "nn" | "ni" | "2opt"
+const [vrpMaxRoute, setVrpMaxRoute] = useState(0);      // 0 = no limit, per-tour cap
 
 
 
@@ -1208,17 +1212,35 @@ const baseScenario =
     };
   } else if (gameMode === "tsp") {
   if (selTspScenario === "custom") {
-    payload = { scenarioId: "tsp", customScenario: makeTspScenario(tspNodes) };
+    payload = {
+      scenarioId: "tsp",
+      distanceMetric: distMetric,
+      tspOpt,
+      customScenario: makeTspScenario(tspNodes)
+    };
   } else {
-    payload = { scenarioId: selTspScenario }; // preset; no customScenario
+    payload = {
+      scenarioId: selTspScenario,
+      distanceMetric: distMetric,
+      tspOpt
+    };
   }
 } else if (gameMode === "vrp") {
   if (selVrpScenario === "custom") {
-    payload = { scenarioId: "vrp", customScenario: makeVrpScenario(vrpCustomers, vrpCapacity) };
+    payload = {
+      scenarioId: "vrp",
+      distanceMetric: distMetric,
+      vrpMaxRoute,
+      customScenario: makeVrpScenario(vrpCustomers, vrpCapacity)
+    };
   } else {
-    payload = { scenarioId: selVrpScenario }; // preset; no customScenario
+    payload = {
+      scenarioId: selVrpScenario,
+      distanceMetric: distMetric,
+      vrpMaxRoute
+    };
   }
-  } else if (gameMode === "tp") {
+} else if (gameMode === "tp") {
   const scn = tpPresets.find(s => s.id === selTpScenario) || tpPresets[0];
   payload = { scenarioId: scn.id, customScenario: scn };
 } else if (gameMode === "ts") {
@@ -1437,6 +1459,31 @@ const baseScenario =
         </div>
       )}
     </div>
+    <div>
+      <label className="block text-xs text-slate-300 mb-1">Distance metric</label>
+      <select
+        value={distMetric}
+        onChange={(e)=>setDistMetric(e.target.value)}
+        className="bg-white/10 rounded-xl px-4 py-2.5 w-full"
+      >
+        <option value="euclid">Euclidean</option>
+        <option value="manhattan">Rectilinear (Manhattan)</option>
+      </select>
+    </div>
+
+    <div>
+      <label className="block text-xs text-slate-300 mb-1">TSP “Optimal” Method</label>
+      <select
+        value={tspOpt}
+        onChange={(e)=>setTspOpt(e.target.value)}
+        className="bg-white/10 rounded-xl px-4 py-2.5 w-full"
+      >
+        <option value="nn">Nearest Neighbor</option>
+        <option value="ni">Nearest Insertion</option>
+        <option value="2opt">2-Opt</option>
+      </select>
+    </div>
+
     {selTspScenario === "custom" && (
       <div>
         <label className="block text-xs text-slate-300 mb-1"># Nodes (incl. depot)</label>
@@ -1449,6 +1496,7 @@ const baseScenario =
       </div>
     )}
   </div>
+  
 )}
 
 
@@ -1470,6 +1518,29 @@ const baseScenario =
         </div>
       )}
     </div>
+    <div>
+  <label className="block text-xs text-slate-300 mb-1">Distance metric</label>
+  <select
+    value={distMetric}
+    onChange={(e)=>setDistMetric(e.target.value)}
+    className="bg-white/10 rounded-xl px-4 py-2.5 w-full"
+  >
+    <option value="euclid">Euclidean</option>
+    <option value="manhattan">Rectilinear (Manhattan)</option>
+  </select>
+</div>
+
+<div>
+  <label className="block text-xs text-slate-300 mb-1">Max route length per tour</label>
+  <input
+    type="number" min={0} step={1}
+    value={vrpMaxRoute}
+    onChange={(e)=>setVrpMaxRoute(Number(e.target.value||0))}
+    className="bg-white/10 rounded-xl px-4 py-2.5 w-full"
+  />
+  <div className="text-xs text-slate-400 mt-1">0 means no limit</div>
+</div>
+
     {selVrpScenario === "custom" && (
       <>
         <div>
@@ -1586,7 +1657,10 @@ function RoundStatus({ round }) {
     if (mode === "tsp") {
       return [
         "TSP: start at S, visit every node exactly once, return to S.",
-        "Distances are Euclidean. No revisits (except final S).",
+        round.distanceMetric === "manhattan"
+        ? "Distances are Rectilinear (Manhattan). No revisits (except final S)."
+        : "Distances are Euclidean. No revisits (except final S).",
+
         "See the Leg Distances panel below the map.",
         "Submit only when tour is complete.",
       ];
@@ -2120,18 +2194,19 @@ function Leaderboards({ room, round }) {
 function RoundLeaderboardCard({ room, round }) {
   const s = getScenarioFromRound(round);
   const entries = Object.entries(round.players || {}).map(([name, r]) => ({ name, ...r }));
-  entries.sort((a, b) => b.score - a.score || a.timeSec - b.timeSec);
-  const ranked = [];
-  let rank = 1, prevScore = null;
-  entries.forEach((e, i) => {
-    if (i === 0) {
-      rank = 1;
-    } else if (e.score !== prevScore) {
-      rank = i + 1; // dense rank by score
-    }
-    ranked.push({ ...e, rank, seasonPts: Math.max(0, 24 - rank) });
-    prevScore = e.score;
-  });
+entries.sort((a, b) => (a.cost - b.cost) || (a.timeSec - b.timeSec));
+const ranked = [];
+let rank = 1, prevCost = null;
+entries.forEach((e, i) => {
+  if (i === 0) {
+    rank = 1;
+  } else if (e.cost !== prevCost) {
+    rank = i + 1; // dense rank by cost
+  }
+  ranked.push({ ...e, rank, seasonPts: Math.max(0, 24 - rank) });
+  prevCost = e.cost;
+});
+
 
   const sNorm = s && Array.isArray(s.nodes) ? s : { ...s, nodes: [], edges: [] };
   const { graphEdges } = useWeightedScenario(sNorm, round);
@@ -2307,10 +2382,10 @@ function costForPayloadPath(scenario, payload, playerPath) {
     const edges = buildGraphEdges(scenario, payload);
     return computePathCost(scenario, payload, playerPath, edges);
   } else if (mode === "tsp") {
-    return tspTourCost(playerPath, scenario.nodes);
-  } else if (mode === "vrp") {
-    return vrpRouteCostFromSequence(playerPath, scenario);
-  } else { // pick
+  return tspTourCost(playerPath, scenario, false, round);
+} else if (mode === "vrp") {
+  return vrpRouteCostFromSequence(playerPath, scenario, round);
+} else { // pick
     return pickTourCost(playerPath, scenario);
   }
 }
@@ -2434,7 +2509,6 @@ function costForPayloadPath(scenario, payload, playerPath) {
 
             </div>
             <div className="text-right text-sm">
-              <div>Score: <span className="font-mono">{h.score ?? "—"}</span></div>
               <div className="text-xs opacity-80">Cost: {h.cost != null ? Number(h.cost).toFixed(2) : "—"} • {h.timeSec ?? "—"}s</div>
             </div>
           </div>
@@ -2687,17 +2761,22 @@ const spAdj = useMemo(() => new Set(graphEdges.map(([u, v]) => `${u}>${v}`)), [g
 
   // Precompute leg lists only for active mode (avoids SP crash)
   const legsTsp = useMemo(
-    () => (round.gameMode === "tsp" ? computeLegsEuclid(path, scenario.nodes) : []),
-    [round.gameMode, path, scenario.nodes]
-  );
+  () => (round.gameMode === "tsp"
+    ? (round.distanceMetric === "manhattan"
+        ? computeLegsManhattan(path, scenario.nodes)
+        : computeLegsEuclid(path, scenario.nodes))
+    : []),
+  [round.gameMode, round.distanceMetric, path, scenario.nodes]
+);
+
   const legsPick = useMemo(
     () => (round.gameMode === "pick" ? computeLegsManhattan(path, scenario.nodes) : []),
     [round.gameMode, path, scenario.nodes]
   );
   const legsVrp = useMemo(
-    () => (round.gameMode === "vrp" ? computeLegsVrp(path, scenario) : []),
-    [round.gameMode, path, scenario]
-  );
+  () => (round.gameMode === "vrp" ? computeLegsVrp(path, scenario, round.distanceMetric) : []),
+  [round.gameMode, round.distanceMetric, path, scenario]
+);
 
   // ===== NEW: TSP next-step distance hints =====
   const tspHintLines = useMemo(() => {
@@ -2729,12 +2808,13 @@ if (round.gameMode === "sp") {
               round.isOpen && (!round.endsAt || Date.now() < round.endsAt);
 } else if (round.gameMode === "tsp") {
   totalCost = legsTsp.reduce((a, L) => a + L.dist, 0);
-  objectiveText = "TSP: visit all nodes, return to S (Euclidean)";
+  objectiveText = `TSP: visit all nodes, return to S (${round.distanceMetric === "manhattan" ? "Rectilinear" : "Euclidean"})`;
   canSubmit = round.isOpen && (!round.endsAt || Date.now() < round.endsAt) &&
     tspIsComplete(path, scenario.nodes);
 } else if (round.gameMode === "vrp") {
   totalCost = legsVrp.reduce((a, L) => a + L.dist, 0);
-  objectiveText = `VRP: serve all customers, cap=${scenario.capacity} (Euclidean)`;
+  objectiveText = `VRP: serve all customers, cap=${scenario.capacity} (${round.distanceMetric === "manhattan" ? "Rectilinear" : "Euclidean"})`;
+
   canSubmit = round.isOpen && (!round.endsAt || Date.now() < round.endsAt) &&
     vrpAllCustomersSelected(path, scenario);
 } else if (round.gameMode === "tp") {
@@ -2779,6 +2859,21 @@ if (round.gameMode === "sp") {
         load += demand[id] ?? 1;
       }
       const dem = demand[v] ?? 1;
+      // Enforce per-tour max route length if configured
+      const D = round.distanceMetric === "manhattan" ? manhattan : euclid;
+      if (Number(round?.vrpMaxRoute) > 0) {
+        const map = Object.fromEntries(scenario.nodes.map(n=>[n.id,n]));
+        let lastS = path.lastIndexOf("S"); if (lastS === -1) lastS = 0;
+        let tourLen = 0;
+        for (let i = lastS; i < path.length - 1; i++) {
+          tourLen += D(map[path[i]], map[path[i + 1]]);
+        }
+        // add the proposed next leg
+        const cur = path[path.length - 1];
+        tourLen += D(map[cur], map[v]);
+        if (tourLen > Number(round.vrpMaxRoute)) return false;
+      }
+
       return load + dem <= cap;
     }
     // picking
@@ -2797,8 +2892,8 @@ if (round.gameMode === "sp") {
   // Baselines for scoring
   const optCost =
   round.gameMode === "sp" ? spOptCost :
-  round.gameMode === "tsp" ? tspBaselineCost(scenario.nodes).cost :
-  round.gameMode === "vrp" ? vrpBaselineCost(scenario).cost :
+  round.gameMode === "tsp" ? tspBaselineCost(scenario, round?.tspOpt || "nn", round).cost :
+  round.gameMode === "vrp" ? vrpClarkeWright(scenario, round).cost :
   round.gameMode === "tp" ? tpOptimalCost(scenario).cost :
   round.gameMode === "ts" ? tsOptimalCost(scenario).cost :
   pickBaselineCost(scenario).cost;
@@ -2835,33 +2930,33 @@ async function onSubmit() {
     myCost = Math.round(legsPick.reduce((a,L)=>a+L.dist,0));
   }
 
-  // Optimal for scoring
-  let optCostVal;
-  if (round.gameMode === "tp")       optCostVal = tpOptimalCost(scenario).cost;
-  else if (round.gameMode === "ts")  optCostVal = tsOptimalCost(scenario).cost;
-  else if (round.gameMode === "sp")  optCostVal = spOptCost;
-  else if (round.gameMode === "tsp") optCostVal = tspOptimalCost(scenario.nodes).cost;
-  else if (round.gameMode === "vrp") optCostVal = vrpOptimalCost(scenario).cost;
-  else                               optCostVal = pickOptimalCost(scenario).cost;
+  // // Optimal for scoring
+  // let optCostVal;
+  // if (round.gameMode === "tp")       optCostVal = tpOptimalCost(scenario).cost;
+  // else if (round.gameMode === "ts")  optCostVal = tsOptimalCost(scenario).cost;
+  // else if (round.gameMode === "sp")  optCostVal = spOptCost;
+  // else if (round.gameMode === "tsp") optCostVal = tspOptimalCost(scenario.nodes).cost;
+  // else if (round.gameMode === "vrp") optCostVal = vrpOptimalCost(scenario).cost;
+  // else                               optCostVal = pickOptimalCost(scenario).cost;
 
-  const score = (Number.isFinite(optCostVal) && optCostVal > 0)
-    ? Math.max(0, Math.round(1000 * (optCostVal / Math.max(myCost, optCostVal)) ))
-    : 0;
+  // const score = (Number.isFinite(optCostVal) && optCostVal > 0)
+  //   ? Math.max(0, Math.round(1000 * (optCostVal / Math.max(myCost, optCostVal)) ))
+  //   : 0;
 
   const r = { ...round, players: { ...(round.players||{}) } };
   if (round.gameMode === "tp" || round.gameMode === "ts") {
     r.players[me.name] = {
-      score,
-      cost: myCost,
-      timeSec,
-      path: round.gameMode === "sp" ? path : null,
-      shipments: round.gameMode === "tp" ? shipments : undefined, // e.g., {"TX→NO":120, ...}
-      flows: round.gameMode === "ts" ? shipments : undefined      // reuse the same object name if you like
-    };
+  cost: myCost,
+  timeSec,
+  path: round.gameMode === "sp" ? path : null,
+  shipments: round.gameMode === "tp" ? shipments : undefined,
+  flows: round.gameMode === "ts" ? shipments : undefined
+};
+
 
     // r.players[me.name] = { cost: myCost, timeSec, score, shipments: { ...(shipments||{}) } };
   } else {
-    r.players[me.name] = { cost: myCost, timeSec, score, path: [...path] };
+    r.players[me.name] = { cost: myCost, timeSec, path: [...path] };
   }
   await saveRoomRound(me.room, r);
   // persist per-player row as well
@@ -2870,15 +2965,11 @@ try {
   const cur = await dbLoadCurrentRoundRow(me.room); // { id } of the open round
   if (cur?.id) {
     await dbUpsertSubmission(cur.id, me.name, {
-      score,
-      cost: myCost,
-      time_sec: timeSec,
-      // keep path if present; TP/TS won’t have one
-      path: r.players?.[me.name]?.path || null
-      // if your submissions table has JSON columns for TP/TS, you can add:
-      // shipments: r.players?.[me.name]?.shipments || null,
-      // flows:     r.players?.[me.name]?.flows || null,
-    });
+  cost: myCost,
+  time_sec: timeSec,
+  path: r.players?.[me.name]?.path || null
+});
+
   }
 } catch (e) {
   console.warn("submissions upsert failed", e);
@@ -2907,7 +2998,7 @@ setSubmitted(true);
           <div>
             <h2 className="text-xl font-bold">{scenario.title}</h2>
             <div className="text-xs text-slate-300">Objective: {objectiveText}</div>
-            <div className="text-xs text-slate-300">Score = 1000 × (baseline / your cost) + max(0, 200 − time)</div>
+            <div className="text-xs text-slate-300">Ranking = lowest objective wins, ties broken by faster time</div>
           </div>
           <div className="text-right">
             <div className="text-sm text-slate-300">Time left</div>
@@ -3450,12 +3541,16 @@ function downloadCsv(csv, filename) {
 }
 
 // Season scoring
+// Season scoring — rank by lower objective (cost/time), tie-breaker: faster time
 function computeStandings(round) {
   const entries = Object.entries(round.players || {}).map(([name, r]) => ({ name, ...r }));
-  entries.sort((a, b) => b.score - a.score || a.timeSec - b.timeSec);
+  // lower cost is better, tie broken by faster time
+  entries.sort((a, b) => (a.cost - b.cost) || (a.timeSec - b.timeSec));
   const standings = entries.map((e, i) => ({ ...e, rank: i + 1, points: Math.max(0, 24 - (i + 1)) }));
   return standings;
 }
+
+
 
 async function applySeasonPoints(room, round, standings /* array */) {
   await dbApplySeasonPoints(room, standings);
@@ -3729,6 +3824,13 @@ function manhattan(a, b) {
   }
   return Math.abs(a.x - b.x) + Math.abs(a.y - b.y);
 }
+function metricFnFor(roundOrScenario) {
+  const m =
+    (roundOrScenario && roundOrScenario.distanceMetric) ||
+    (roundOrScenario && roundOrScenario.metric);
+  return m === "manhattan" ? manhattan : euclid;
+}
+
 
 
 // ====== TSP helpers (Euclidean)
@@ -3739,74 +3841,86 @@ function tspIsComplete(path, nodes){
   for (const id of ids) if (!path.includes(id)) return false;
   return true;
 }
-function tspTourCost(path, nodes, allowPartial=false){
+function tspTourCost(path, scenarioOrNodes, allowPartial=false, round=null){
+  const nodes = Array.isArray(scenarioOrNodes?.nodes) ? scenarioOrNodes.nodes : scenarioOrNodes;
   const map = nodeByIdMap(nodes);
+  const D = metricFnFor(round || scenarioOrNodes);
   let cost = 0;
   for (let i=0;i<path.length-1;i++){
     const a = map[path[i]], b = map[path[i+1]];
     if (!a || !b) return Infinity;
-    cost += euclid(a,b);
+    cost += D(a,b);
   }
-  if (!allowPartial && path.length>1 && path[path.length-1]==="S" && path[0]==="S"){
-    return cost;
+  if (!allowPartial){
+    // existing completion checks remain as in your function
   }
-  return cost;
+return cost;
 }
 // Baseline: NN + 2-opt
-function tspBaselineCost(nodes) {
-  if (!Array.isArray(nodes) || nodes.length === 0) {
-    console.error("tspBaselineCost: invalid nodes argument", nodes);
-    return { cost: Infinity, path: [] };
-  }
+function tspBaselineCost(scenarioOrNodes, algo = "nn", round = null) {
+  const nodes = Array.isArray(scenarioOrNodes?.nodes) ? scenarioOrNodes.nodes : scenarioOrNodes;
+  if (!Array.isArray(nodes) || nodes.length === 0) return { cost: Infinity, path: [] };
+  const map = nodeByIdMap(nodes);
+  if (!map["S"]) return { cost: Infinity, path: [] };
+  const D = metricFnFor(round || scenarioOrNodes);
+  const idsExceptS = nodes.filter(n => n.id !== "S").map(n => n.id);
 
-  const bad = nodes.filter(n => !(n && typeof n.id === "string" && Number.isFinite(n.x) && Number.isFinite(n.y)));
-  if (bad.length) console.error("tspBaselineCost: malformed node entries:", bad);
-
-  const clean = nodes.filter(n => n && typeof n.id === "string" && Number.isFinite(n.x) && Number.isFinite(n.y));
-  const map = nodeByIdMap(clean);
-
-  if (!map["S"]) {
-    console.error("tspBaselineCost: missing depot node 'S' in nodes:", clean);
-    return { cost: Infinity, path: [] };
-  }
-
-  // Nearest-neighbour from S
-  let un = new Set(clean.filter(n => n.id !== "S").map(n => n.id));
-  let tour = ["S"], cur = "S";
-  while (un.size) {
-    let bestId = null, bestd = Infinity;
-    for (const id of un) {
-      const d = euclid(map[cur], map[id]);
-      if (d < bestd) { bestd = d; bestId = id; }
+  const nnTour = () => {
+    let un = new Set(idsExceptS);
+    let tour = ["S"], cur = "S";
+    while (un.size) {
+      let best = null, bd = Infinity;
+      for (const id of un) { const d = D(map[cur], map[id]); if (d < bd) { bd = d; best = id; } }
+      if (!best) break; tour.push(best); un.delete(best); cur = best;
     }
-    if (!bestId) break;
-    tour.push(bestId);
-    un.delete(bestId);
-    cur = bestId;
-  }
-  tour.push("S");
+    tour.push("S"); return tour;
+  };
 
-  // 2-opt improvement
-  const ids = tour.slice();
-  const coord = id => map[id];
-  let improved = true;
-  while (improved) {
-    improved = false;
-    for (let i = 1; i < ids.length - 2; i++) {
-      for (let k = i + 1; k < ids.length - 1; k++) {
-        const A = ids[i - 1], B = ids[i], C = ids[k], D = ids[k + 1];
-        const delta = (euclid(coord(A), coord(C)) + euclid(coord(B), coord(D)))
-                    - (euclid(coord(A), coord(B)) + euclid(coord(C), coord(D)));
-        if (delta < -1e-6) {
-          ids.splice(i, k - i + 1, ...ids.slice(i, k + 1).reverse());
-          improved = true;
+  const niTour = () => {
+    let nearest = null, bd = Infinity;
+    for (const id of idsExceptS) { const d = D(map["S"], map[id]); if (d < bd) { bd = d; nearest = id; } }
+    let tour = ["S", nearest, "S"];
+    const un = new Set(idsExceptS.filter(x => x !== nearest));
+    while (un.size) {
+      let cand = null, cd = Infinity;
+      for (const id of un) {
+        for (let i = 0; i < tour.length - 1; i++) {
+          const a = tour[i], b = tour[i+1];
+          const add = D(map[a], map[id]) + D(map[id], map[b]) - D(map[a], map[b]);
+          if (add < cd) { cd = add; cand = { id, i }; }
+        }
+      }
+      if (!cand) break;
+      tour.splice(cand.i + 1, 0, cand.id);
+      un.delete(cand.id);
+    }
+    return tour;
+  };
+
+  const twoOpt = (route) => {
+    const ids = route.slice();
+    let improved = true;
+    while (improved) {
+      improved = false;
+      for (let i = 1; i < ids.length - 2; i++) {
+        for (let k = i + 1; k < ids.length - 1; k++) {
+          const A = ids[i - 1], B = ids[i], C = ids[k], Dn = ids[k + 1];
+          const delta = (D(map[A], map[C]) + D(map[B], map[Dn]))
+                      - (D(map[A], map[B]) + D(map[C], map[Dn]));
+          if (delta < -1e-6) { ids.splice(i, k - i + 1, ...ids.slice(i, k + 1).reverse()); improved = true; }
         }
       }
     }
-  }
+    return ids;
+  };
 
-  return { cost: tspTourCost(ids, clean), path: ids };
+  let tour = (algo === "ni") ? niTour() : nnTour();
+  if (algo === "2opt") tour = twoOpt(tour);
+
+  const cost = tspTourCost(tour, { nodes }, false, round);
+  return { cost, path: tour };
 }
+
 
 
 
@@ -3816,7 +3930,8 @@ function vrpAllCustomersSelected(path, scenario){
   for (const id of cust) if (!path.includes(id)) return false;
   return true;
 }
-function vrpRouteCostFromSequence(seq, scenario){
+function vrpRouteCostFromSequence(seq, scenario, round=null){
+  const D = metricFnFor(round || scenario);
   const map = nodeByIdMap(scenario.nodes);
   if (seq.length===0) return 0;
   let cost=0, load=0, cap=scenario.capacity||8;
@@ -3860,6 +3975,61 @@ function vrpBaselineCost(scenario) {
   const cost = vrpRouteCostFromSequence(seq, { ...scenario, nodes });
   return { cost, path: seq };
 }
+function vrpClarkeWright(scenario, round) {
+  const D = metricFnFor(round || scenario);
+  const nodes = scenario.nodes;
+  const map = nodeByIdMap(nodes);
+  const depot = map["S"];
+  const demand = scenario.demand || {};
+  const cap = Number(scenario.capacity || 8);
+  const maxRoute = Number(round?.vrpMaxRoute || 0);
+
+  const customers = nodes.filter(n => n.id !== "S").map(n => n.id);
+
+  // initial routes: S-i-S
+  let routes = customers.map(id => ({ seq: ["S", id, "S"], load: demand[id] ?? 1 }));
+
+  const routeLen = (seq) =>
+    seq.slice(0, -1).reduce((c, _, i) => c + D(map[seq[i]], map[seq[i+1]]), 0);
+
+  // savings list
+  const savings = [];
+  for (let i = 0; i < customers.length; i++) {
+    for (let j = i + 1; j < customers.length; j++) {
+      const a = customers[i], b = customers[j];
+      const s = D(depot, map[a]) + D(depot, map[b]) - D(map[a], map[b]);
+      savings.push({ a, b, s });
+    }
+  }
+  savings.sort((x, y) => y.s - x.s);
+
+  const head = r => r.seq[1];
+  const tail = r => r.seq[r.seq.length - 2];
+  const findRouteIndex = (cust) => routes.findIndex(r => r.seq.includes(cust));
+
+  for (const { a, b } of savings) {
+    const ra = findRouteIndex(a), rb = findRouteIndex(b);
+    if (ra === -1 || rb === -1 || ra === rb) continue;
+    const R1 = routes[ra], R2 = routes[rb];
+    // merge tail(R1)=a with head(R2)=b
+    if (tail(R1) !== a || head(R2) !== b) continue;
+
+    const newLoad = (R1.load || 0) + (R2.load || 0);
+    if (newLoad > cap) continue;
+
+    const merged = { seq: [...R1.seq.slice(0, -1), ...R2.seq.slice(1)], load: newLoad };
+
+    if (maxRoute > 0 && routeLen(merged.seq) > maxRoute) continue;
+
+    routes.splice(Math.max(ra, rb), 1);
+    routes.splice(Math.min(ra, rb), 1, merged);
+  }
+
+  const flat = routes.flatMap(r => r.seq.slice(0, -1)).concat("S");
+  const totalCost = flat.slice(0, -1).reduce((c, _, i) => c + D(map[flat[i]], map[flat[i+1]]), 0);
+  return { cost: Math.round(totalCost), path: flat };
+}
+
 
 
 
@@ -3947,7 +4117,8 @@ function computeLegsManhattan(path, nodes){
     out.push({from:path[i], to:path[i+1], dist: Math.abs(a.x-b.x)+Math.abs(a.y-b.y)});
   } return out;
 }
-function computeLegsVrp(path, scenario){
+function computeLegsVrp(path, scenario, metric){
+  const D = metric === "manhattan" ? manhattan : euclid;
   const map = Object.fromEntries(scenario.nodes.map(n=>[n.id,n]));
   const demand = scenario.demand || {};
   const cap = scenario.capacity || 8;
@@ -3955,18 +4126,19 @@ function computeLegsVrp(path, scenario){
   for(let i=1;i<path.length;i++){
     const next = path[i];
     if(!map[cur] || !map[next]) continue;
-    const dist = Math.hypot(map[cur].x - map[next].x, map[cur].y - map[next].y);
+    const dist = D(map[cur], map[next]);
     if(next === "S"){
       out.push({from:cur, to:"S", dist, loadAfter:0});
       cur = "S"; load = 0; continue;
     }
     const d = demand[next] ?? 1;
     if(load + d > cap){
-      const toDepot = Math.hypot(map[cur].x - map["S"].x, map[cur].y - map["S"].y);
+      const toDepot = D(map[cur], map["S"]);
       out.push({from:cur, to:"S", dist: toDepot, loadAfter: 0});
       cur = "S"; load = 0;
     }
-    const go = Math.hypot(map[cur].x - map[next].x, map[cur].y - map[next].y);
+    const go = D(map[cur], map[next]);
+
     load += d; out.push({from:cur, to:next, dist: go, loadAfter: load});
     cur = next;
   }
@@ -4097,7 +4269,7 @@ async function dbListSubmissions(roundId) {
       .from("submissions")
       .select("id, round_id, username, score, cost, time_sec, path")
       .eq("round_id", roundId)
-      .order("score", { ascending: false });
+      .order("cost", { ascending: true });
     if (error) { console.error("dbListSubmissions error", error); return []; }
     return data || [];
   } catch (e) {
@@ -4249,9 +4421,10 @@ function computeOptimalForRound(scenario, round, graphEdges) {
     case "sp":
       return dijkstra(scenario.nodes, graphEdges, scenario.start, scenario.end);
     case "tsp":
-      return tspBaselineCost(scenario.nodes);
+  return tspBaselineCost(scenario, round?.tspOpt || "nn", round);
     case "vrp":
-      return vrpBaselineCost(scenario);
+  return vrpClarkeWright(scenario, round);
+
     case "pick":
     default:
       return pickBaselineCost(scenario);
