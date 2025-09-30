@@ -753,6 +753,56 @@ function findScenarioById(id) {
   );
 }
 
+// Resolves the active scenario from a round payload, honoring embedded custom
+function getScenarioFromRound(round) {
+  const p = round?.payload || {};
+  return p.customScenario || findScenarioById(p.scenarioId) || null;
+}
+
+// Build numeric weighted edges for SP based on round objectives and modifiers
+function buildGraphEdges(scn, roundOrPayload) {
+  if (!scn || !Array.isArray(scn.edges)) return [];
+
+  const p = (roundOrPayload && roundOrPayload.payload) ? roundOrPayload.payload : (roundOrPayload || {});
+  const mode = (p.objectiveMode || "single").toLowerCase();
+  const objA = (p.objA || scn.objective || "time").toLowerCase();
+  const objB = (p.objB || "cost").toLowerCase();
+  const alpha = Number.isFinite(p.alpha) ? p.alpha : 1;
+
+  return scn.edges.map(([u, v, wOrMeta]) => {
+    let base;
+    if (wOrMeta != null && typeof wOrMeta === "object") {
+      const a = toNum(wOrMeta[objA]);
+      if (mode === "dual") {
+        const b = toNum(wOrMeta[objB]);
+        base = alpha * a + (1 - alpha) * b;
+      } else {
+        base = a;
+      }
+    } else {
+      base = toNum(wOrMeta);
+    }
+
+    // Apply optional modifiers
+    let factor = 1;
+    if (Array.isArray(scn.modifiers)) {
+      for (const m of scn.modifiers) {
+        if (m && typeof m.affect === "function") {
+          try { factor *= Number(m.affect([u, v, wOrMeta])) || 1; } catch {}
+        }
+      }
+    }
+
+    const w = Number.isFinite(base) ? base * factor : Infinity;
+    return [u, v, w];
+  });
+
+  function toNum(x) {
+    const n = Number(x);
+    return Number.isFinite(n) ? n : Infinity;
+  }
+}
+
 
 
 // -----------------------------
@@ -805,42 +855,66 @@ function saveStore(data) { localStorage.setItem(LS_KEY, JSON.stringify(data)); }
 
 // Async load/save now use Supabase. Keep simple local cache for fast UI.
 async function loadRoomRound(room) {
-  const offline = localStorage.getItem("scma_supa_offline") === "1";
   const key = `scma_round_${room}`;
-  const cachedStr = localStorage.getItem(key);
-  const cached = cachedStr ? JSON.parse(cachedStr) : null;
 
-  // Only trust cache if the round is OPEN; otherwise we may still keep it
-  // temporarily if the instructor revealed the leaderboard.
+  // Treat us as offline if any of these are true
+  const offline =
+    localStorage.getItem("scma_supa_offline") === "1" ||
+    typeof window === "undefined" ||
+    typeof supabase === "undefined" ||
+    typeof dbLoadCurrentRound !== "function";
+
+  // Read cache
+  let cached = null;
+  try {
+    const cachedStr = localStorage.getItem(key);
+    cached = cachedStr ? JSON.parse(cachedStr) : null;
+  } catch {
+    cached = null;
+  }
+
+  // If we have an OPEN cached round, prefer it for immediate UX
   if (cached?.isOpen) {
+    // Opportunistic refresh only when online and helper exists
     if (!offline) {
-      dbLoadCurrentRound(room).then((fresh) => {
+      try {
+        const fresh = await dbLoadCurrentRound(room);
         if (fresh) {
           const cStart = cached?.startedAt ?? 0;
           const fStart = fresh?.startedAt ?? 0;
+          // Only overwrite if the server copy is the same round or newer
           if (fStart >= cStart) {
             localStorage.setItem(key, JSON.stringify(fresh));
           }
         } else {
-          // DB says no open round -> mark cache as closed so clients stop timer
+          // Server says no open round → force-close the cached one
           const closed = { ...cached, isOpen: false, endsAt: cached?.endsAt || Date.now() };
           localStorage.setItem(key, JSON.stringify(closed));
         }
-      }).catch(() => {/* ignore */});
+      } catch {
+        // swallow; stay on cached
+      }
     }
     return cached;
-  } else if (cached?.revealBoard) {
-    // Closed but leaderboard is being shown: keep cache so players see results
-    return cached;
-  } else {
-    // closed/old cache → remove
-    localStorage.removeItem(key);
   }
 
-  // Fetch current open round from DB
-  const fresh = await dbLoadCurrentRound(room);
-  if (fresh) localStorage.setItem(key, JSON.stringify(fresh));
-  return fresh;
+  // If we’re in a closed/reveal state, keep showing cached leaderboard
+  if (cached?.revealBoard) return cached;
+
+  // Otherwise clear stale cache
+  localStorage.removeItem(key);
+
+  // If offline or the DB helper isn't present, we can't fetch a fresh round
+  if (offline) return null;
+
+  // Try fetching the current open round
+  try {
+    const fresh = await dbLoadCurrentRound(room);
+    if (fresh) localStorage.setItem(key, JSON.stringify(fresh));
+    return fresh || null;
+  } catch {
+    return null;
+  }
 }
 
 async function dbLoadCurrentRoundRow(room) {
@@ -862,25 +936,37 @@ async function saveRoomRound(room, round) {
   try {
     if (!round) {
       localStorage.removeItem(key);
-      await dbSaveRound(room, null);
+      if (typeof dbSaveRound === "function") {
+        await dbSaveRound(room, null);
+      }
       return;
     }
-    const row = await dbSaveRound(room, round);
-    const merged = row?.id ? { ...round, id: row.id } : round;
+    let merged = { ...round };
+    if (typeof dbSaveRound === "function") {
+      const row = await dbSaveRound(room, round);
+      if (row?.id) merged = { ...round, id: row.id };
+    }
     localStorage.setItem(key, JSON.stringify(merged));
-  } catch (err) {
-    // Fallback to local only (useful when DB schema doesn’t accept TP/TS yet)
+  } catch {
+    // Fallback to local-only cache
     if (round) localStorage.setItem(key, JSON.stringify(round));
   }
 }
 
 
+
 async function loadSeason(room) {
-  // returns { totals: {name: points}, history: [] } (adapted for your UI)
-  const rows = await dbLoadSeasonTotals(room);
-  const totals = {};
-  for (const r of rows) totals[r.username] = r.points;
-  return { totals, history: [] };
+  try {
+    if (typeof dbLoadSeasonTotals === "function") {
+      const rows = await dbLoadSeasonTotals(room);
+      const totals = {};
+      for (const r of rows) totals[r.username] = r.points;
+      return { totals, history: [] };
+    }
+  } catch {}
+  // Local fallback
+  const s = loadStore();
+  return s["season:" + room] || { totals: {}, history: [] };
 }
 
 // --- Day leaderboard (MDT) ---
@@ -896,25 +982,84 @@ function todayKeyMDT() { return dateKeyInTZ(new Date(), MDT_TZ); }
 
 async function loadDayTotals(room) {
   const today = todayKeyMDT();
-  // Get recent closed rounds for this room
-  const rounds = await dbListPastRounds(room, 100);
   const totals = {};
-  for (const r of rounds) {
-    const started = r.started_at ? new Date(r.started_at) : null;
-    if (!started) continue;
-    const key = dateKeyInTZ(started, MDT_TZ);
-    if (key !== today) continue;               // only today (MDT)
-    const payload = r.payload || {};
-    // Build standings for this round using in-game score + time
-    const standings = computeStandings(payload);
-    for (const s of standings) {
-      totals[s.name] = (totals[s.name] || 0) + Math.max(0, 24 - s.rank);
+  if (typeof dbListPastRounds !== "function") return [];
+  try {
+    const rounds = await dbListPastRounds(room, 100);
+    for (const r of rounds || []) {
+      const started = r.started_at ? new Date(r.started_at) : null;
+      if (!started) continue;
+      const key = dateKeyInTZ(started, MDT_TZ);
+      if (key !== today) continue;
+      const payload = r.payload || {};
+      const standings = computeStandings(payload);
+      for (const s of standings) {
+        totals[s.name] = (totals[s.name] || 0) + Math.max(0, 24 - s.rank);
+      }
     }
-  }
-  // Convert to [{name, pts}] sorted desc
+  } catch {}
   return Object.entries(totals)
     .map(([name, pts]) => ({ name, pts }))
     .sort((a, b) => b.pts - a.pts || a.name.localeCompare(b.name));
+}
+
+
+
+
+
+
+// ⬇️ ADD: light hook to memoize weighted edges when needed by UI
+function useWeightedScenario(scn, round) {
+  const graphEdges = React.useMemo(() => buildGraphEdges(scn, round), [scn, round]);
+  return { graphEdges };
+}
+
+
+function formatPathLabels(scn, path, sep = "→") {
+  if (!Array.isArray(path) || !path.length) return "";
+  // If nodes have labels, map ids to labels for nicer display
+  const id2label = new Map((scn?.nodes || []).map(n => [n.id, n.label || n.id]));
+  return path.map(id => id2label.get(id) || id).join(` ${sep} `);
+}
+
+// Very safe, local-only standings computation for SP/TSP/VRP/TP/TS
+function computeStandings(payloadOrRound) {
+  const r = payloadOrRound?.players ? payloadOrRound : { players: payloadOrRound?.players || {} };
+  const entries = Object.entries(r.players || {}).map(([name, v]) => ({
+    name,
+    cost: Number(v.cost ?? Infinity),
+    timeSec: Number(v.timeSec ?? Infinity),
+  }));
+  entries.sort((a, b) => (a.cost - b.cost) || (a.timeSec - b.timeSec));
+  const out = [];
+  let rank = 0, lastCost = null, lastTime = null;
+  entries.forEach((e, i) => {
+    if (i === 0 || e.cost !== lastCost || e.timeSec !== lastTime) rank = i + 1;
+    out.push({ ...e, rank });
+    lastCost = e.cost; lastTime = e.timeSec;
+  });
+  return out;
+}
+
+// Season points applier that won’t crash without DB
+function applySeasonPoints(room, round, standings, roster = []) {
+  try {
+    const s = loadStore();
+    const key = "season:" + room;
+    const season = s[key] || { totals: {}, history: [] };
+    for (const row of standings) {
+      const pts = Math.max(0, 24 - row.rank);
+      season.totals[row.name] = (season.totals[row.name] || 0) + pts;
+    }
+    s[key] = season;
+    saveStore(s);
+    if (typeof dbUpsertSeasonTotals === "function") {
+      // best-effort async; ignore errors
+      Object.entries(season.totals).forEach(([username, points]) => {
+        try { dbUpsertSeasonTotals(room, username, points); } catch {}
+      });
+    }
+  } catch {}
 }
 
 
@@ -1211,43 +1356,42 @@ const baseScenario =
       objA, objB, alpha,
     };
   } else if (gameMode === "tsp") {
-  if (selTspScenario === "custom") {
-    payload = {
-      scenarioId: "tsp",
-      distanceMetric: distMetric,
-      tspOpt,
-      customScenario: makeTspScenario(tspNodes)
-    };
+    if (selTspScenario === "custom") {
+      payload = {
+        scenarioId: "tsp",
+        distanceMetric: distMetric,
+        tspOpt,
+        customScenario: makeTspScenario(tspNodes)
+      };
+    } else {
+      payload = {
+        scenarioId: selTspScenario,
+        distanceMetric: distMetric,
+        tspOpt
+      };
+    }
+  } else if (gameMode === "vrp") {
+    if (selVrpScenario === "custom") {
+      payload = {
+        scenarioId: "vrp",
+        distanceMetric: distMetric,
+        vrpMaxRoute,
+        customScenario: makeVrpScenario(vrpCustomers, vrpCapacity)
+      };
+    } else {
+      payload = {
+        scenarioId: selVrpScenario,
+        distanceMetric: distMetric,
+        vrpMaxRoute
+      };
+    }
+  } else if (gameMode === "tp") {
+    const scn = tpPresets.find(s => s.id === selTpScenario) || tpPresets[0];
+    payload = { scenarioId: scn.id, customScenario: scn };
+  } else if (gameMode === "ts") {
+    const scn = tsPresets.find(s => s.id === selTsScenario) || tsPresets[0];
+    payload = { scenarioId: scn.id, customScenario: scn };
   } else {
-    payload = {
-      scenarioId: selTspScenario,
-      distanceMetric: distMetric,
-      tspOpt
-    };
-  }
-} else if (gameMode === "vrp") {
-  if (selVrpScenario === "custom") {
-    payload = {
-      scenarioId: "vrp",
-      distanceMetric: distMetric,
-      vrpMaxRoute,
-      customScenario: makeVrpScenario(vrpCustomers, vrpCapacity)
-    };
-  } else {
-    payload = {
-      scenarioId: selVrpScenario,
-      distanceMetric: distMetric,
-      vrpMaxRoute
-    };
-  }
-} else if (gameMode === "tp") {
-  const scn = tpPresets.find(s => s.id === selTpScenario) || tpPresets[0];
-  payload = { scenarioId: scn.id, customScenario: scn };
-} else if (gameMode === "ts") {
-  const scn = tsPresets.find(s => s.id === selTsScenario) || tsPresets[0];
-  payload = { scenarioId: scn.id, customScenario: scn };
-  } else {
-  // existing pick payload…
     payload = { scenarioId: "pick", customScenario: makePickingScenario(pickRows, pickCols, pickCount) };
   }
 
@@ -1256,12 +1400,13 @@ const baseScenario =
     isOpen: true, revealBoard: false, players: {},
     startedAt: now, endsAt, durationSec: countdownSec, scored: false,
     gameMode,
-    ...payload,
+    payload,
   };
 
   await saveRoomRound(room, newRound);
   setRound(newRound);
 };
+
 
 
   const onClose = async () => {
@@ -1531,7 +1676,7 @@ const baseScenario =
 </div>
 
 <div>
-  <label className="block text-xs text-slate-300 mb-1">Max route length per tour</label>
+  <label className="block text-xs text-slate-300 mb-1">Max distance per tour (S→…→S)</label>
   <input
     type="number" min={0} step={1}
     value={vrpMaxRoute}
@@ -2190,75 +2335,77 @@ function Leaderboards({ room, round }) {
 
 }
 
-
 function RoundLeaderboardCard({ room, round }) {
   const s = getScenarioFromRound(round);
+  const scenarioTitle = s?.title ?? "—";
+
   const entries = Object.entries(round.players || {}).map(([name, r]) => ({ name, ...r }));
-entries.sort((a, b) => (a.cost - b.cost) || (a.timeSec - b.timeSec));
-const ranked = [];
-let rank = 1, prevCost = null;
-entries.forEach((e, i) => {
-  if (i === 0) {
-    rank = 1;
-  } else if (e.cost !== prevCost) {
-    rank = i + 1; // dense rank by cost
+  entries.sort((a, b) => (a.cost - b.cost) || (a.timeSec - b.timeSec));
+
+  const ranked = [];
+  let rank = 1, prevCost = null, prevTime = null;
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    if (i === 0 || e.cost !== prevCost || e.timeSec !== prevTime) rank = i + 1;
+    ranked.push({ ...e, rank, seasonPts: Math.max(0, 24 - rank) });
+    prevCost = e.cost; prevTime = e.timeSec;
   }
-  ranked.push({ ...e, rank, seasonPts: Math.max(0, 24 - rank) });
-  prevCost = e.cost;
-});
 
+  // Never spread a possibly-null scenario
+  const sNorm = (s && Array.isArray(s.nodes))
+    ? s
+    : { nodes: [], edges: [], start: "S", end: "T", objective: "time", title: scenarioTitle };
 
-  const sNorm = s && Array.isArray(s.nodes) ? s : { ...s, nodes: [], edges: [] };
   const { graphEdges } = useWeightedScenario(sNorm, round);
 
+  // If some solver helpers aren’t defined yet, don’t crash
+  const safeCall = (fn, ...args) => (typeof fn === "function" ? fn(...args) : { cost: Infinity, path: [] });
 
-  const opt = useMemo(() => {
-  switch (round.gameMode) {
-    case "sp":
-      if (!s?.nodes?.length) return { cost: Infinity, path: [] };
-      return dijkstra(s.nodes, graphEdges, s.start, s.end);
-    case "tsp":
-      return tspOptimalCost(s.nodes || []);
-    case "vrp":
-      return vrpOptimalCost(s);
-    case "tp":
-      return { path: [], cost: tpOptimalCost(s).cost };
-    case "ts":
-      return { path: [], cost: tsOptimalCost(s).cost };
-    case "pick":
-    default:
-      return pickOptimalCost(s);
-  }
-}, [round.gameMode, s, graphEdges]);
-
-
+  const opt = React.useMemo(() => {
+    switch (round.gameMode) {
+      case "sp":
+        if (!sNorm.nodes.length) return { cost: Infinity, path: [] };
+        return dijkstra(sNorm.nodes, graphEdges, sNorm.start, sNorm.end);
+      case "tsp":
+        return safeCall(tspOptimalCost, sNorm.nodes || []);
+      case "vrp":
+        return safeCall(vrpOptimalCost, sNorm);
+      case "tp":
+        return { path: [], cost: safeCall(tpOptimalCost, sNorm).cost };
+      case "ts":
+        return { path: [], cost: safeCall(tsOptimalCost, sNorm).cost };
+      case "pick":
+      default:
+        return safeCall(pickOptimalCost, sNorm);
+    }
+  }, [round.gameMode, sNorm, graphEdges]);
 
   const objLabel = round.objectiveMode === "dual"
-  ? `${Math.round(100 * (round.alpha ?? 0.5))}% ${round.objA} + ${Math.round(100 * (1 - (round.alpha ?? 0.5)))}% ${round.objB}`
-  : (round.objA || s.objective || "time");
-
+    ? `${Math.round(100 * (round.alpha ?? 0.5))}% ${round.objA} + ${Math.round(100 * (1 - (round.alpha ?? 0.5)))}% ${round.objB}`
+    : ((round.gameMode === "tsp" || round.gameMode === "vrp")
+        ? (round.distanceMetric === "manhattan" ? "Manhattan distance" : "Euclidean distance")
+        : (round.objA || sNorm.objective || "time"));
 
   return (
     <div className="rounded-2xl bg-white/5 p-6 ring-1 ring-white/10 shadow-xl lg:col-span-2">
       <h2 className="text-xl font-bold mb-1">This Round — Room {room}</h2>
-      <div className="text-xs text-slate-300">Scenario: {s.title}</div>
+      <div className="text-xs text-slate-300">Scenario: {scenarioTitle}</div>
       <div className="text-xs text-slate-300 mb-4">
-  {round.gameMode === "tp" || round.gameMode === "ts"
-    ? <>Optimal cost: {fmt(opt.cost)}</>
-    : <>Optimal: {formatPathLabels(s, opt.path, "→")} • {objLabel}: {fmt(opt.cost)}</>
-  }
-</div>
-
+        {round.gameMode === "tp" || round.gameMode === "ts"
+          ? <>Optimal: {fmt(opt.cost)}</>
+          : <>Optimal: {formatPathLabels(sNorm, opt.path, "→")} • {objLabel}: {fmt(opt.cost)}</>
+        }
+      </div>
 
       <div className="space-y-2">
-        {entries.length === 0 && <div className="text-slate-400">No submissions this round.</div>}
-        {entries.map((e, i) => (
+        {ranked.length === 0 && <div className="text-slate-400">No submissions this round.</div>}
+        {ranked.map((e, i) => (
           <div key={e.name} className={`flex items-center justify-between rounded-xl px-4 py-3 ${i === 0 ? "bg-yellow-500/20" : i === 1 ? "bg-slate-400/20" : i === 2 ? "bg-amber-700/30" : "bg-white/5"}`}>
             <div className="flex items-center gap-3">
               <Medal rank={i + 1} />
               <div>
                 <div className="font-semibold">{e.name}</div>
-                <div className="text-xs text-slate-300">In-game {e.score} • Cost {fmt(e.cost)} • {e.timeSec}s</div>
+                <div className="text-xs text-slate-300">Objective {fmt(e.cost ?? e.timeSec)} • Time {e.timeSec ?? "—"}s</div>
               </div>
             </div>
             <div className="text-right text-xs">
@@ -2267,10 +2414,12 @@ entries.forEach((e, i) => {
           </div>
         ))}
       </div>
+
       <ExportCsvButtonRound round={round} />
     </div>
   );
 }
+
 
 function SeasonLeaderboardCard({ room, season }) {
   // season totals (existing)
@@ -2279,12 +2428,14 @@ function SeasonLeaderboardCard({ room, season }) {
   const todayKey = todayKeyMDT();
 
   useEffect(() => {
-    if (boardTab !== "day") return;
-    (async () => {
-      const rows = await loadDayTotals(room);
-      setDayTotals(rows);
-    })();
-  }, [room, boardTab, season]);
+  if (boardTab !== "day") return;
+  (async () => {
+    if (typeof dbListPastRounds !== "function") { setDayTotals([]); return; }
+    const rows = await loadDayTotals(room); // already guarded inside
+    setDayTotals(rows);
+  })();
+}, [room, boardTab, season]);
+
 
   const totals = Object.entries(season.totals || {}).map(([name, pts]) => ({ name, pts }));
 
@@ -2314,105 +2465,135 @@ function SeasonLeaderboardCard({ room, season }) {
 useEffect(() => {
   let alive = true;
   (async () => {
-    if (!selPlayer) { setPlayerHist([]); return; }
-    const rows = await dbListPlayerHistory(room, selPlayer.username || selPlayer.name);
+    if (!selPlayer || typeof dbListPlayerHistory !== "function") { setPlayerHist([]); return; }
+    const rows = await dbListPlayerHistory(room, selPlayer.username || selPlayer.name, 100);
     if (!alive) return;
-    setPlayerHist(rows);
+    setPlayerHist(rows || []);
   })();
   return () => { alive = false; };
 }, [selPlayer, room]);
 
 
+
   // Load past rounds when panel is opened
   useEffect(() => {
-    if (!histOpen) return;
-    let alive = true;
-    (async () => {
-      setHistLoading(true);
+  if (!histOpen) return;
+  let alive = true;
+  (async () => {
+    setHistLoading(true);
+    if (typeof dbListPastRounds !== "function") {
+      setHist([]); setHistLoading(false); return;
+    }
+    try {
       const rows = await dbListPastRounds(room, 100);
       if (!alive) return;
-      setHist(rows);
-      setHistLoading(false);
-    })();
-    return () => { alive = false; };
-  }, [histOpen, room]);
+      setHist(rows || []);
+    } finally {
+      if (alive) setHistLoading(false);
+    }
+  })();
+  return () => { alive = false; };
+}, [histOpen, room]);
 
-function scenarioFromPayload(payload) {
-  if (!payload) return null;
-  // TP/TS: accept customScenario even without nodes
-  if (payload?.customScenario) return payload.customScenario;
-  const s = findScenarioById(payload?.scenarioId);
-  return s || null;
+
+
+// --- Safe call helper (won’t crash if fn missing or throws)
+function safeCall(fn, fallback, ...args) {
+  try { return (typeof fn === "function") ? fn(...args) : fallback; }
+  catch { return fallback; }
 }
 
+// Get scenario from payload or registry (works for TP/TS too)
+function scenarioFromPayload(payload) {
+  if (!payload) return null;
+  if (payload.customScenario) return payload.customScenario;
+  return findScenarioById(payload.scenarioId) || null;
+}
 
-
-  // Helper: compute optimal for a past round (supports all modes)
-// Helper: compute optimal for a past round (supports all modes incl. TP/TS)
-function computeOptimalForPayload(scenario, payload) {
+// Compute an "optimal" for a past round (all modes) with safety
+function computeOptimalForPayload(scenario, payload, modeHint) {
   if (!scenario) return { path: [], cost: Infinity };
-  const mode = payload?.gameMode || "sp";
+
+  const mode = (modeHint
+    || payload?.gameMode
+    || payload?.mode
+    || "sp");
+
   if (mode === "sp") {
     if (!scenario?.nodes?.length) return { path: [], cost: Infinity };
     const edges = buildGraphEdges(scenario, payload);
     return dijkstra(scenario.nodes, edges, scenario.start, scenario.end);
-  } else if (mode === "tsp") {
-    return tspOptimalCost(scenario.nodes);
-  } else if (mode === "vrp") {
-    return vrpOptimalCost(scenario);
-  } else if (mode === "tp") {
-    const { cost } = tpOptimalCost(scenario);
-    return { path: [], cost };
-  } else if (mode === "ts") {
-    const { cost } = tsOptimalCost(scenario);
-    return { path: [], cost };
-  } else {
-    return pickOptimalCost(scenario);
   }
+  if (mode === "tsp") {
+    return safeCall(tspOptimalCost, { cost: Infinity, path: [] }, scenario.nodes || []);
+  }
+  if (mode === "vrp") {
+    return safeCall(vrpOptimalCost, { cost: Infinity, path: [] }, scenario);
+  }
+  if (mode === "tp") {
+    const res = safeCall(tpOptimalCost, { cost: Infinity, flows: {} }, scenario);
+    return { path: [], cost: res.cost };
+  }
+  if (mode === "ts") {
+    const res = safeCall(tsOptimalCost, { cost: Infinity, flows: {} }, scenario);
+    return { path: [], cost: res.cost };
+  }
+  // picking default
+  return safeCall(pickOptimalCost, { path: [], cost: Infinity }, scenario);
 }
 
-
-
-
-  // Helper: recompute a player's path cost for a past round
-function costForPayloadPath(scenario, payload, playerPath) {
+// Recompute a player's submitted path cost for a past round, safely
+function costForPayloadPath(scenario, payload, playerPath, modeHint) {
   if (!Array.isArray(playerPath) || playerPath.length < 2) return null;
-  const mode = payload?.gameMode || "sp";
+
+  const mode = (modeHint
+    || payload?.gameMode
+    || payload?.mode
+    || "sp");
+
   if (mode === "sp") {
     const edges = buildGraphEdges(scenario, payload);
-    return computePathCost(scenario, payload, playerPath, edges);
-  } else if (mode === "tsp") {
-  return tspTourCost(playerPath, scenario, false, round);
-} else if (mode === "vrp") {
-  return vrpRouteCostFromSequence(playerPath, scenario, round);
-} else { // pick
-    return pickTourCost(playerPath, scenario);
+    return safeCall(computePathCost, null, scenario, payload, playerPath, edges);
   }
+  if (mode === "tsp") {
+    return safeCall(tspTourCost, null, playerPath, scenario, false, payload);
+  }
+  if (mode === "vrp") {
+    return safeCall(vrpRouteCostFromSequence, null, playerPath, { scenario: payload, nodes: scenario.nodes });
+  }
+  // pick / tp / ts fallback to grid/euclid tour cost if you expose one
+  return safeCall(pickTourCost, null, playerPath, scenario);
 }
 
+  
+  
 
-  async function openHistoryRound(row) {
-    setSelPlayer(null);
-    setSel(row);
-    const payload = row?.payload || {};
-    const scenario = scenarioFromPayload(payload);
-    const opt = computeOptimalForPayload(scenario, payload);
-    setBest(opt);
-    const s = await dbListSubmissions(row.id);
-    if (s && s.length) {
-      setSubs(s);
-    } else {
-      const players = Object.entries(payload.players || {}).map(([username, r]) => ({
-        id: username,
-        username,
-        score: r.score,
-        cost: r.cost,
-        time_sec: r.timeSec,
-        path: r.path,
-      }));
-      setSubs(players);
-    }
+
+async function openHistoryRound(row) {
+  setSelPlayer(null);
+  setSel(row);
+
+  const payload = row?.payload || {};
+  const scenario = scenarioFromPayload(payload);
+  const modeHint = row?.game_mode || row?.gameMode || payload?.gameMode;
+
+  setBest(computeOptimalForPayload(scenario, payload, modeHint));
+
+  let s = [];
+  if (typeof dbListSubmissions === "function") {
+    try { s = await dbListSubmissions(row.id); } catch {}
   }
+  if (!s || !s.length) {
+    // fall back to what we saved inside payload at close/reveal time
+    const playersObj = payload.players || row?.players || {};
+    s = Object.entries(playersObj).map(([username, r]) => ({
+      id: username, username,
+      score: r.score, cost: r.cost, time_sec: r.timeSec, path: r.path,
+    }));
+  }
+  setSubs(s || []);
+}
+
 
   return (
     <div className="rounded-2xl bg-gradient-to-br from-emerald-800/60 to-teal-900/60 p-6 ring-1 ring-white/10 shadow-xl">
@@ -2449,7 +2630,7 @@ function costForPayloadPath(scenario, payload, playerPath) {
     <div key={e.name} className={`flex items-center justify-between rounded-xl px-3 py-2 ${i === 0 ? "bg-emerald-700/40" : i === 1 ? "bg-emerald-700/25" : i === 2 ? "bg-amber-700/30" : "bg-white/5"}`}>
       <div className="flex items-center gap-3">
         <Medal rank={i + 1} />
-        <button className="font-semibold hover:underline underline-offset-2" onClick={() => setSelectedPlayer(e.name)}>{e.name}</button>
+        <button className="font-semibold hover:underline underline-offset-2" onClick={() => setSelectedPlayer({ username: e.username || e.name, displayName: roster?.[e.username || e.name]?.displayName || (e.displayName || e.name) })}>{e.name}</button>
       </div>
       <div className="text-right text-sm font-bold">{e.pts} pts</div>
     </div>
@@ -2500,7 +2681,7 @@ function costForPayloadPath(scenario, payload, playerPath) {
         {optPairs.length ? optPairs.map(([k,q]) => `${k}:${q}`).join(", ") : "—"}
       </div>
       <div className="text-[11px] opacity-60 font-mono">
-        Optimal cost: {Number.isFinite(opt.cost) ? Number(opt.cost).toFixed(2) : "—"}
+        Optimal : {Number.isFinite(opt.cost) ? Number(opt.cost).toFixed(2) : "—"}
       </div>
     </div>
   );
@@ -2578,7 +2759,7 @@ function costForPayloadPath(scenario, payload, playerPath) {
                         <div className="text-xs opacity-80">{new Date(sel.started_at || sel.created_at).toLocaleString()}</div>
                         <div className="text-xs mt-1">Game mode: <span className="font-mono">{payload?.gameMode || "sp"}</span></div>
                         <div className="text-sm mt-1">
-                          Optimal ({objLabel}): <span className="font-mono">{optimalScore}</span>
+                          Optimal: <span className="font-mono">{optimalScore}</span>
                         </div>
 
                       </div>
@@ -3213,7 +3394,13 @@ const nodeById = Object.fromEntries(vnodes.map(n => [n.id, n]));
                 orient="auto-start-reverse">
           <path d="M0,0 L10,5 L0,10 z" fill="context-stroke" />
         </marker>
+        <pattern id="grid" width="50" height="50" patternUnits="userSpaceOnUse">
+          <path d="M 50 0 L 0 0 0 50" fill="none" stroke="#1f2937" strokeWidth="1" />
+        </pattern>
+
       </defs>
+      <rect x="0" y="0" width={W} height={H} fill="url(#grid)" opacity="0.25" />
+
       {/* base edges (SP) */}
       {edges.map(([u, v, w, m], idx) => {
         const a = nodeById[u], b = nodeById[v];
@@ -3358,8 +3545,13 @@ function EdgeLabel({ a, b, text }) {
 // Helpers & Hooks
 // -----------------------------
 function unitForObjective(obj) { return obj === "time" ? "min" : obj === "cost" ? "$" : obj === "co2" ? "kg CO₂" : ""; }
-function fmt(x) { if (x >= 1000 && Number.isFinite(x)) return Math.round(x).toLocaleString(); return Math.round(x * 10) / 10; }
-
+function fmt(x) {
+  const n = Number(x);
+  if (!Number.isFinite(n)) return "—";
+  if (Math.abs(n) >= 1000) return Math.round(n).toLocaleString();
+  if (Number.isInteger(n)) return String(n);
+  return (Math.round(n * 10) / 10).toString();
+}
 function applyModifiers(scenario) {
   if (!scenario.modifiers?.length) return scenario.edges;
   return scenario.edges.map((e) => {
@@ -3405,32 +3597,7 @@ function effectiveWeight(scenario, edge, round) {
   }
 }
 
-function useWeightedScenario(scenario, round) {
-  const graphEdges = useMemo(() => {
-    if (!scenario?.edges?.length) return [];
-    const withW = scenario.edges.map(([u, v, meta, mode]) => {
-      const w = effectiveWeight(scenario, [u, v, meta, mode], round);
-      return [u, v, w, mode];
-    });
-    return applyModifiers({ ...scenario, edges: withW });
-  }, [scenario, round?.objectiveMode, round?.objA, round?.objB, round?.alpha]);
 
-  const opt = useMemo(() => {
-    if (!scenario?.nodes?.length) return { cost: Infinity, path: [] };
-    return dijkstra(scenario.nodes, graphEdges, scenario.start, scenario.end);
-  }, [scenario, graphEdges]);
-
-  return { graphEdges, optCost: opt.cost };
-}
-
-function buildGraphEdges(scenario, round) {
-  if (!scenario?.edges?.length) return [];
-  const withW = scenario.edges.map(([u, v, meta, mode]) => {
-    const w = effectiveWeight(scenario, [u, v, meta, mode], round);
-    return [u, v, w, mode];
-  });
-  return applyModifiers({ ...scenario, edges: withW });
-}
 
 
 
@@ -3478,13 +3645,6 @@ function useRound(room) {
 }
 
 
-function getScenarioFromRound(round) {
-  if (!round) return null;
-  // TP/TS have no nodes — accept any customScenario object
-  if (round.customScenario) return round.customScenario;
-  const s = findScenarioById(round.scenarioId);
-  return s ?? null;
-}
 
 
 
@@ -3497,12 +3657,6 @@ function nodeLabelFor(scenario, id) {
   const hit = scenario.nodes.find(n => n?.id === id);
   return hit?.label || String(id ?? "");
 }
-function formatPathLabels(scenario, path, sep = " → ") {
-  if (!scenario || !Array.isArray(path)) return "";
-  const map = new Map((scenario.nodes || []).map(n => [n.id, n.label || n.id]));
-  return path.map(id => map.get(id) ?? id).join(sep);
-}
-
 // === small geometry helper (render-only spacing; does not change scenario data) ===
 function separateNodes(nodes, W, H, min = 36, iters = 20) {
   const clamped = v => Math.max(10, Math.min(v, (v === v ? v : 10))); // guard NaN
@@ -3542,19 +3696,10 @@ function downloadCsv(csv, filename) {
 
 // Season scoring
 // Season scoring — rank by lower objective (cost/time), tie-breaker: faster time
-function computeStandings(round) {
-  const entries = Object.entries(round.players || {}).map(([name, r]) => ({ name, ...r }));
-  // lower cost is better, tie broken by faster time
-  entries.sort((a, b) => (a.cost - b.cost) || (a.timeSec - b.timeSec));
-  const standings = entries.map((e, i) => ({ ...e, rank: i + 1, points: Math.max(0, 24 - (i + 1)) }));
-  return standings;
-}
 
 
 
-async function applySeasonPoints(room, round, standings /* array */) {
-  await dbApplySeasonPoints(room, standings);
-}
+
 
 
 
@@ -3569,101 +3714,113 @@ async function applySeasonPoints(room, round, standings /* array */) {
 // -----------------------------
 // Custom Network Generator (wide, non-colinear)
 // -----------------------------
-function makeCustomScenario(n = 12, objective = "time", opts = {}) {
-  // Layout box only for generation; SvgMap will auto-scale it.
-  const BOX_W = 1200, BOX_H = 640, PAD = 60;
-  const X0 = PAD, X1 = BOX_W - PAD, Y0 = PAD, Y1 = BOX_H - PAD;
 
-  const minDist = Math.max(40, Math.min(110, Number(opts.minDist || 76))); // spacing between nodes
-  const density = Math.max(1, Math.min(3, Number(opts.density || 2)));     // edges per node
+function makeCustomScenario(numNodes = 12, objective = "time", opts = {}) {
+  const N = Math.max(4, Math.floor(Number(numNodes) || 12));
+  const { spread = 1.8, density = 2, height = 360, minDist = 44 } = opts || {};
 
-  n = Math.max(6, Math.min(30, Math.floor(n)));
+  const W = Math.round(900 * Math.max(0.6, Math.min(3, spread)));
+  const H = Math.round(Math.max(160, height));
+  const midCount = Math.max(2, N - 2);
 
-  // --- 1) Place nodes (Poisson-ish): S and T fixed, others random with min distance
-  const nodes = [];
-  const S = { id: "S", x: X0, y: Y0 + 80, label: "Start" };
-  const T = { id: "T", x: X1, y: Y1 - 80, label: "Target" };
-  nodes.push(S);
-  nodes.push(T);
+  // id generator A,B,C... then N#
+  const makeId = (i) => (i < 26 ? String.fromCharCode(65 + i) : `N${i - 25}`);
 
-  const pts = [];
-  let attempts = 0, maxAttempts = 6000;
-  while (pts.length < n - 2 && attempts < maxAttempts) {
-    attempts++;
-    const x = X0 + Math.random() * (X1 - X0);
-    const y = Y0 + Math.random() * (Y1 - Y0);
+  // place S and T anchored left/right
+  const nodes = [{ id: "S", x: 40, y: Math.round(H / 2), label: "S" }];
 
-    // keep away from S/T and other points
-    if (Math.hypot(x - S.x, y - S.y) < minDist) continue;
-    if (Math.hypot(x - T.x, y - T.y) < minDist) continue;
-
-    let ok = true;
-    for (const p of pts) {
-      if (Math.hypot(x - p.x, y - p.y) < minDist) { ok = false; break; }
+  // random placement for intermediate nodes with simple collision avoidance
+  for (let i = 0; i < midCount; i++) {
+    let tries = 0;
+    while (tries < 200) {
+      const x = Math.round(60 + Math.random() * (W - 120));
+      const y = Math.round(40 + Math.random() * (H - 80));
+      let ok = true;
+      for (const n of nodes) {
+        const dx = n.x - x, dy = n.y - y;
+        if (Math.hypot(dx, dy) < Math.max(minDist, 28)) { ok = false; break; }
+      }
+      if (ok) { nodes.push({ id: makeId(i), x, y, label: makeId(i) }); break; }
+      tries++;
+      if (tries === 199) {
+        nodes.push({ id: makeId(i), x: Math.round(60 + Math.random() * (W - 120)), y: Math.round(40 + Math.random() * (H - 80)), label: makeId(i) });
+        break;
+      }
     }
-    if (!ok) continue;
-
-    pts.push({ x, y });
-  }
-  // if we didn't hit target count, relax spacing at the end
-  while (pts.length < n - 2) {
-    const x = X0 + Math.random() * (X1 - X0);
-    const y = Y0 + Math.random() * (Y1 - Y0);
-    pts.push({ x, y });
   }
 
-  // Sort by x so edges naturally go left→right, then assign ids/labels
-  pts.sort((a, b) => a.x - b.x);
-  for (let i = 0; i < pts.length; i++) {
-    const id = `N${i + 1}`;
-    nodes.splice(nodes.length - 1, 0, { id, x: Math.round(pts[i].x), y: Math.round(pts[i].y), label: id });
+  nodes.push({ id: "T", x: W - 40, y: Math.round(H / 2), label: "T" });
+
+  // simple Euclidean distance
+  function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
+
+  // produce numeric metric from pixel distance, tuned by objective
+  function metricFromDist(px) {
+    const base = px / 10;
+    switch (objective) {
+      case "time": return Math.max(1, Number(base.toFixed(2)));
+      case "cost": return Math.max(0.5, Number((base * 0.9).toFixed(2)));
+      case "co2":  return Math.max(0.1, Number((base * 0.28).toFixed(2)));
+      default: return Math.max(1, Number(base.toFixed(2)));
+    }
   }
 
-  // --- 2) Build edges forward with distance-based metrics
-  const modes = ["🚚", "🚂", "✈️"];
+  // Build edges so graph is connected and interesting:
+  // 1) sort by x and add chain edges left->right
+  // 2) add forward skip edges and occasional backward edges based on density
+  const nodesByX = [...nodes].sort((a, b) => a.x - b.x);
   const edges = [];
-  for (let i = 0; i < nodes.length - 1; i++) {
-    // each node connects to a few ahead nodes (controls density and “width”)
-    const tries = density + 1; // 2..4 targets
-    for (let t = 0; t < tries; t++) {
-      const jumpMax = 2 + density; // connect 1..(2+density) steps ahead
-      const j = Math.min(nodes.length - 1, i + 1 + randInt(0, jumpMax));
-      if (j <= i) continue;
-      if (edges.some(e => e[0] === nodes[i].id && e[1] === nodes[j].id)) continue;
 
-      const dx = nodes[j].x - nodes[i].x, dy = nodes[j].y - nodes[i].y;
-      const dist = Math.hypot(dx, dy) / 10;
-      const mode = modes[randInt(0, modes.length - 1)];
-      const metrics = makeMetrics(dist, mode); // {time,cost,co2}
-      edges.push([nodes[i].id, nodes[j].id, metrics, mode]);
+  for (let i = 0; i < nodesByX.length - 1; i++) {
+    const u = nodesByX[i], v = nodesByX[i + 1];
+    edges.push([u.id, v.id, metricFromDist(dist(u, v)), "🚚"]);
+  }
+
+  const extra = Math.max(0, Math.round((density - 1) * 1.5));
+  for (let i = 0; i < nodesByX.length; i++) {
+    const u = nodesByX[i];
+    for (let k = 2; k <= 2 + extra; k++) {
+      const j = i + k;
+      if (j >= nodesByX.length) break;
+      const v = nodesByX[j];
+      if (!edges.some(e => e[0] === u.id && e[1] === v.id) && Math.random() < Math.min(0.9, 0.25 + density * 0.15)) {
+        edges.push([u.id, v.id, metricFromDist(dist(u, v)), "🚚"]);
+      }
+    }
+    if (i > 0 && Math.random() < 0.25 * (density / 2)) {
+      const v = nodesByX[Math.max(0, i - 1)];
+      if (!edges.some(e => e[0] === u.id && e[1] === v.id)) {
+        edges.push([u.id, v.id, metricFromDist(dist(u, v) * 1.05), "🚚"]);
+      }
     }
   }
 
-  // Ensure S has at least one outgoing and T has at least one incoming
+  // Safety guarantees
   if (!edges.some(e => e[0] === "S")) {
-    const j = 1; // first intermediate
-    const dist = Math.hypot(nodes[j].x - S.x, nodes[j].y - S.y) / 10;
-    edges.push(["S", nodes[j].id, makeMetrics(dist, "🚚"), "🚚"]);
+    const v = nodesByX[1] || nodesByX[0];
+    edges.push(["S", v.id, metricFromDist(dist(nodesByX[0], v)), "🚚"]);
   }
   if (!edges.some(e => e[1] === "T")) {
-    const i = nodes.length - 2; // last intermediate
-    const dist = Math.hypot(T.x - nodes[i].x, T.y - nodes[i].y) / 10;
-    edges.push([nodes[i].id, "T", makeMetrics(dist, "🚚"), "🚚"]);
+    const i = nodesByX.length - 2;
+    const from = nodesByX[i] || nodesByX[0];
+    edges.push([from.id, "T", metricFromDist(dist(from, nodesByX[nodesByX.length - 1])), "🚚"]);
   }
 
   return {
-    id: "custom",
-    title: `Custom Network (${n} nodes)`,
-    subtitle: "Generated by instructor",
+    id: `custom-${N}`,
+    title: `Custom ${N}-node (${objective})`,
+    subtitle: "Procedurally generated network",
     objective,
     nodes,
-    edges,             // [u, v, {time,cost,co2}, mode]
     start: "S",
     end: "T",
+    edges,            // [u, v, numericMetric, mode]
     modifiers: [],
-    _hasMetrics: true,
+    _hasMetrics: false
   };
 }
+
+
 
 
 // ===== TSP scenario (Euclidean complete graph; we don't draw all edges)
@@ -3930,28 +4087,37 @@ function vrpAllCustomersSelected(path, scenario){
   for (const id of cust) if (!path.includes(id)) return false;
   return true;
 }
-function vrpRouteCostFromSequence(seq, scenario, round=null){
-  const D = metricFnFor(round || scenario);
-  const map = nodeByIdMap(scenario.nodes);
-  if (seq.length===0) return 0;
-  let cost=0, load=0, cap=scenario.capacity||8;
-  let cur="S";
+function vrpRouteCostFromSequence(seq, { scenario, nodes }) {
+  const D = metricFnFor(scenario);
+  const map = nodeByIdMap(nodes);
+  const cap = Number(scenario.capacity) || 8;
   const demand = scenario.demand || {};
-  for (let i=1;i<seq.length;i++){
+  let cost = 0;
+  let cur = "S";
+  let load = cap; // start full at depot
+
+  for (let i = 1; i < seq.length; i++) {
     const next = seq[i];
-    if (next==="S"){ cost += euclid(map[cur], map["S"]); cur="S"; load=0; continue; }
-    const dem = demand[next] || 1;
-    if (load + dem > cap){
-      // return to depot, then go to next
-      cost += euclid(map[cur], map["S"]);
-      cur="S"; load=0;
+    if (next === "S") {
+      cost += D(map[cur], map["S"]);
+      cur = "S";
+      load = cap; // reload to full
+      continue;
     }
-    cost += euclid(map[cur], map[next]); cur=next; load += dem;
+    const dem = demand[next] || 1;
+    if (load < dem) {
+      cost += D(map[cur], map["S"]);
+      cur = "S";
+      load = cap;
+    }
+    cost += D(map[cur], map[next]);
+    cur = next;
+    load -= dem; // deliver
   }
-  // return to depot at the end if not already there
-  if (cur!=="S") cost += euclid(map[cur], map["S"]);
+  if (cur !== "S") cost += D(map[cur], map["S"]);
   return cost;
 }
+
 // vrpBaselineCost - robust version (greedy heuristic)
 function vrpBaselineCost(scenario) {
   if (!scenario || !Array.isArray(scenario.nodes)) {
@@ -4250,7 +4416,7 @@ async function dbUpsertSubmission(roundId, username, rec) {
         username,
         cost: rec.cost,
         time_sec: rec.timeSec,
-        score: rec.score,
+        // score: rec.score,
         path: rec.path, // array is fine if column is JSONB
       },
       { onConflict: "round_id,username", ignoreDuplicates: false }
@@ -4287,7 +4453,6 @@ async function dbListPlayerHistory(room, username, limit = 50) {
         id,
         round_id,
         username,
-        score,
         cost,
         time_sec,
         path,
@@ -4307,7 +4472,6 @@ async function dbListPlayerHistory(room, username, limit = 50) {
       roundId: r.round_id,
       startedAt: r.rounds.started_at,
       payload,
-      score: r.score,
       cost: r.cost,
       timeSec: r.time_sec,
       path: r.path,
@@ -4326,31 +4490,23 @@ async function dbListPlayerHistory(room, username, limit = 50) {
 
 
 async function dbApplySeasonPoints(room, standings) {
-  // standings = array of { name, rank } sorted by score
-  const sorted = [...standings].sort((a,b)=> b.score - a.score || a.timeSec - b.timeSec);
-  let rank = 1, prevScore = null;
-  const rows = sorted.map((s, i) => {
-    if (i === 0) rank = 1;
-    else if (s.score !== prevScore) rank = i + 1;
-    prevScore = s.score;
-    return { room, username: s.name, points: Math.max(0, 24 - rank) };
-  });
-  // Upsert by incrementing points
-  for (const r of rows) {
+  for (const s of standings) {
     const { data } = await supabase
       .from("season_totals")
       .select("points")
-      .eq("room", r.room)
-      .eq("username", r.username)
+      .eq("room", room)
+      .eq("username", s.name)
       .maybeSingle();
-    const newPts = (data?.points || 0) + r.points;
+    const newPts = (data?.points || 0) + (s.points || 0);
     await supabase.from("season_totals").upsert({
-      room: r.room,
-      username: r.username,
+      room,
+      username: s.name,
       points: newPts,
     });
   }
 }
+
+
 
 async function dbLoadSeasonTotals(room) {
   const { data } = await supabase
