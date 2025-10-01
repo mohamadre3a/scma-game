@@ -1,4 +1,5 @@
 import React, { useMemo, useRef, useState, useEffect } from "react";
+import { supabase } from "./lib/supabase"; 
 
 /**
  * SCMA Morning Dash — Shortest Path Race (v2)
@@ -358,6 +359,23 @@ const tspPresets = [
   edges: [], start:"S", end:"S", _hasMetrics:true
 },
 ];
+
+async function loadDisplayNameMap(room) {
+  const map = {};
+  try {
+    if (typeof supabase !== "undefined") {
+      const { data, error } = await supabase
+        .from("roster")
+        .select("username, display_name")
+        .eq("room", room);
+      if (error) throw error;
+      for (const r of data || []) {
+        if (r?.username) map[r.username] = r.display_name || r.username;
+      }
+    }
+  } catch {}
+  return map;
+}
 
 
 /** ============================== TRANSPORTATION / TRANSSHIPMENT HELPERS ==============================
@@ -753,11 +771,27 @@ function findScenarioById(id) {
   );
 }
 
-// Resolves the active scenario from a round payload, honoring embedded custom
+
 function getScenarioFromRound(round) {
-  const p = round?.payload || {};
-  return p.customScenario || findScenarioById(p.scenarioId) || null;
+  if (!round) return null;
+  const p = round.payload || {};
+
+  // 1) Most reliable: frozen snapshot saved at round open
+  const snap = p.snapshotScenario || round.snapshotScenario;
+  if (snap && (Array.isArray(snap.nodes) || Array.isArray(snap.supplies))) return snap;
+
+  // 2) Custom inline (explicit)
+  if (p.customScenario) return p.customScenario;
+
+  // 3) Explicit preset by id
+  const preset = findScenarioById(p.scenarioId);
+  if (preset) return preset;
+
+  // 4) Otherwise, do NOT guess — return null so UI shows "scenario unavailable".
+  return null;
 }
+
+
 
 // Build numeric weighted edges for SP based on round objectives and modifiers
 function buildGraphEdges(scn, roundOrPayload) {
@@ -845,6 +879,9 @@ function dijkstra(nodes, edges, start, end) {
   }
   return { cost: dist.get(end), path };
 }
+
+
+
 
 // -----------------------------
 // Local Storage Store (rounds, season, roster)
@@ -955,19 +992,30 @@ async function saveRoomRound(room, round) {
 
 
 
+// DB-only season totals, mapped to display_name via roster
+// Season leaderboard — DB is the single source of truth
 async function loadSeason(room) {
-  try {
-    if (typeof dbLoadSeasonTotals === "function") {
-      const rows = await dbLoadSeasonTotals(room);
-      const totals = {};
-      for (const r of rows) totals[r.username] = r.points;
-      return { totals, history: [] };
-    }
-  } catch {}
-  // Local fallback
-  const s = loadStore();
-  return s["season:" + room] || { totals: {}, history: [] };
+  if (typeof supabase === "undefined") return { totals: {}, history: [] };
+  const { data, error } = await supabase
+    .from("season_totals_v")
+    .select("display_name, points")
+    .eq("room", room)
+    .order("points", { ascending: false })
+    .order("display_name", { ascending: true });
+  if (error) return { totals: {}, history: [] };
+  const totals = {};
+  for (const r of data || []) totals[r.display_name] = r.points;
+  return { totals, history: [] };
 }
+
+
+
+
+
+
+
+
+
 
 // --- Day leaderboard (MDT) ---
 const MDT_TZ = "America/Edmonton";
@@ -980,28 +1028,25 @@ function dateKeyInTZ(date, tz = MDT_TZ) {
 }
 function todayKeyMDT() { return dateKeyInTZ(new Date(), MDT_TZ); }
 
+// Today leaderboard = sum of submission.score across rounds started today (MDT)
 async function loadDayTotals(room) {
-  const today = todayKeyMDT();
-  const totals = {};
-  if (typeof dbListPastRounds !== "function") return [];
-  try {
-    const rounds = await dbListPastRounds(room, 100);
-    for (const r of rounds || []) {
-      const started = r.started_at ? new Date(r.started_at) : null;
-      if (!started) continue;
-      const key = dateKeyInTZ(started, MDT_TZ);
-      if (key !== today) continue;
-      const payload = r.payload || {};
-      const standings = computeStandings(payload);
-      for (const s of standings) {
-        totals[s.name] = (totals[s.name] || 0) + Math.max(0, 24 - s.rank);
-      }
-    }
-  } catch {}
-  return Object.entries(totals)
-    .map(([name, pts]) => ({ name, pts }))
-    .sort((a, b) => b.pts - a.pts || a.name.localeCompare(b.name));
+  const today = todayKeyMDT(); // "YYYY-MM-DD" in MDT
+  if (typeof supabase === "undefined") return [];
+  const { data, error } = await supabase
+    .from("leaderboard_day_v")
+    .select("display_name, pts")
+    .eq("room", room)
+    .eq("date_mdt", today)
+    .order("pts", { ascending: false })
+    .order("display_name", { ascending: true });
+  if (error) return [];
+  return (data || []).map(r => ({ name: r.display_name, pts: r.pts }));
 }
+
+
+
+
+
 
 
 
@@ -1042,25 +1087,45 @@ function computeStandings(payloadOrRound) {
 }
 
 // Season points applier that won’t crash without DB
-function applySeasonPoints(room, round, standings, roster = []) {
+// Season points applier that won’t crash without DB
+// Season points writer — DB only. Absolute totals are stored in season_totals.
+async function applySeasonPoints(room, round, standings) {
+  if (typeof supabase === "undefined") return;
+  const BASE = 24; // points = max(0, 24 - rank)
+
+  // 1) read current totals for this room
+  let current = {};
   try {
-    const s = loadStore();
-    const key = "season:" + room;
-    const season = s[key] || { totals: {}, history: [] };
-    for (const row of standings) {
-      const pts = Math.max(0, 24 - row.rank);
-      season.totals[row.name] = (season.totals[row.name] || 0) + pts;
-    }
-    s[key] = season;
-    saveStore(s);
-    if (typeof dbUpsertSeasonTotals === "function") {
-      // best-effort async; ignore errors
-      Object.entries(season.totals).forEach(([username, points]) => {
-        try { dbUpsertSeasonTotals(room, username, points); } catch {}
-      });
-    }
-  } catch {}
+    const { data, error } = await supabase
+      .from("season_totals")
+      .select("username, points")
+      .eq("room", room);
+    if (error) throw error;
+    for (const r of data || []) current[r.username] = Number(r.points || 0);
+  } catch {
+    // If we can't read, don't attempt a write.
+    return;
+  }
+
+  // 2) compute new absolute totals and upsert
+  const upserts = [];
+  for (const row of standings || []) {
+    const u = row.name; // you store usernames in players keys
+    const add = Math.max(0, BASE - row.rank);
+    const newTotal = (current[u] || 0) + add;
+    upserts.push({ room, username: u, points: newTotal });
+  }
+
+  if (upserts.length) {
+    try {
+      await supabase
+        .from("season_totals")
+        .upsert(upserts, { onConflict: "room,username" });
+    } catch {}
+  }
 }
+
+
 
 
 function saveSeason(room, season) { const s = loadStore(); s["season:" + room] = season; saveStore(s); }
@@ -1113,7 +1178,6 @@ export default function App() {
         {!me ? (
           <LoginGate
             onLogin={(profile) => {
-              // Keep using your existing store shape for compatibility
               const s = loadStore();
               s.me = { name: profile.name, room: profile.room };
               saveStore(s);
@@ -1222,8 +1286,11 @@ function HowToCard() {
       <ul className="space-y-2 text-sm">
         <li>• Instructor opens a round and picks a scenario or generates a custom network.</li>
         <li>• Countdown is visible; click nodes to build a valid route and submit before time runs out.</li>
-        <li>• Score = <code>1000 × (best ÷ yours) + max(0, 200 − seconds)</code>.</li>
-        <li>• Season points = <span className="font-semibold">24 − place</span> (min 0). No submit = 0.</li>
+        {/* <li>• Score = <code>1000 × (best ÷ yours) + max(0, 200 − seconds)</code>.</li> */}
+        <li>• Season/Daily points = <span className="font-semibold">24 − place</span> (min 0). Tie on cost breaks by finish time.</li>
+
+
+        
         <li>• Leaderboards: This Round + Season (cumulative).</li>
       </ul>
       <h4 className="text-sm font-semibold mt-4 mb-1">Game goals</h4>
@@ -1294,15 +1361,67 @@ const [vrpMaxRoute, setVrpMaxRoute] = useState(0);      // 0 = no limit, per-tou
   const [countdownSec, setCountdownSec] = useState(90);
 
   // Auto-score once a round is closed
-  useEffect(() => {
-    if (round && !round.isOpen && !round.scored) {
-      const r2 = { ...round, scored: true };
-      const standings = computeStandings(r2);
-      applySeasonPoints(room, r2, standings, roster);
-      saveRoomRound(room, r2);
+   // Auto-award points once a round is closed (no "score", only points)
+useEffect(() => {
+  if (round && !round.isOpen && !round.scored) {
+    (async () => {
+      let r2 = attachPointsAndRanks({ ...round });
+
+      const optimal = computeOptimalForRound(r2);
+      r2 = {
+        ...r2,
+        optimal: { cost: optimal.cost, path: optimal.path || [] },
+        snapshotScenario: r2.payload?.snapshotScenario || getScenarioFromRound(r2),
+      };
+
+      // ✅ write per-player results to DB (optional)
+      if (typeof dbUpdateSubmissionPoints === "function") {
+        for (const [u, p] of Object.entries(r2.players || {})) {
+          try { dbUpdateSubmissionPoints(r2.id, u, p.points ?? 0, p.rank ?? null); } catch {}
+        }
+      }
+
+      // (You can remove this if you go full DB for season)
+      applySeasonPoints(room, r2, r2.standings, roster);
+
+      // ✅ save history with display_name
+      const nameMap = await loadDisplayNameMap(room);
+      const hist = loadHistory(room);
+      hist.unshift({
+        id: r2.id,
+        room,
+        gameMode: r2.gameMode,
+        startedAt: r2.startedAt,
+        endedAt: r2.endsAt || Date.now(),
+        scenario: r2.snapshotScenario,
+        objective: {
+          mode: r2.payload?.objectiveMode || "single",
+          objA: r2.payload?.objA || r2.snapshotScenario?.objective || "time",
+          objB: r2.payload?.objB || "cost",
+          alpha: r2.payload?.alpha ?? 1,
+          distanceMetric: r2.payload?.distanceMetric || null,
+          vrpMaxRoute: r2.payload?.vrpMaxRoute || 0,
+        },
+        optimal: r2.optimal,
+        results: (r2.standings || []).map(r => ({
+          username: r.name,
+          display_name: nameMap[r.name] || r.name,
+          cost: r.cost,
+          timeSec: r.timeSec,
+          rank: r.rank,
+          points: Math.max(0, 24 - r.rank),
+        }))
+      });
+      saveHistory(room, hist.slice(0, 200));
+
+      r2 = { ...r2, scored: true };
+      await saveRoomRound(room, r2);
       setRound(r2);
-    }
-  }, [round?.isOpen]);
+    })();
+  }
+}, [round?.isOpen]);
+
+
 
   if (round?.revealBoard) {
     return <Leaderboards room={room} round={round} />;
@@ -1343,6 +1462,7 @@ const baseScenario =
   const endsAt = countdownSec > 0 ? now + countdownSec * 1000 : null;
 
   let payload;
+
   if (gameMode === "sp") {
     payload = {
       scenarioId: selScenario,
@@ -1395,6 +1515,22 @@ const baseScenario =
     payload = { scenarioId: "pick", customScenario: makePickingScenario(pickRows, pickCols, pickCount) };
   }
 
+  // NEW: freeze the exact scenario used so history can always render it later
+  const usedScenario =
+    gameMode === "sp"
+      ? (payload.customScenario || ([...scenarios, ...spCalgaryPresets].find(x => x.id === selScenario)))
+      : gameMode === "tsp"
+      ? (payload.customScenario || tspPresets.find(x => x.id === selTspScenario))
+      : gameMode === "vrp"
+      ? (payload.customScenario || vrpPresets.find(x => x.id === selVrpScenario))
+      : gameMode === "tp"
+      ? (tpPresets.find(x => x.id === (payload.scenarioId || selTpScenario)))
+      : gameMode === "ts"
+      ? (tsPresets.find(x => x.id === (payload.scenarioId || selTsScenario)))
+      : payload.customScenario;
+
+  if (usedScenario) payload.snapshotScenario = usedScenario;
+
   const newRound = {
     id, room,
     isOpen: true, revealBoard: false, players: {},
@@ -1406,6 +1542,7 @@ const baseScenario =
   await saveRoomRound(room, newRound);
   setRound(newRound);
 };
+
 
 
 
@@ -1433,9 +1570,10 @@ const baseScenario =
 };
 
   const onSeasonReset = async () => {
-    await dbResetSeason(room);
-    saveSeason(room, { totals: {}, history: [] });
-  };
+  await dbResetSeason(room);
+  // DB-only season; no local save
+};
+
 
 
   return (
@@ -1761,7 +1899,8 @@ const baseScenario =
           <li>Close or auto-close at 0s.</li>
           <li>Reveal leaderboards: This Round + Season.</li>
         </ol>
-        <p className="text-xs text-indigo-200 mt-3">Season points: 1st → 19, 2nd → 18, … 20th → 0.</p>
+        <p className="text-xs text-indigo-200 mt-3">Season points: 1st → 23, 2nd → 22, … 24th → 0.</p>
+
       </div>
 
       <div className="lg:col-span-3">
@@ -1778,7 +1917,8 @@ function RoundStatus({ round }) {
   const left = round.endsAt ? Math.max(0, Math.ceil((round.endsAt - Date.now()) / 1000)) : null;
   const mode = round.gameMode || "sp";
 
-  const cap = s?.capacity ?? round.customScenario?.capacity ?? null;
+  const cap = s?.capacity ?? round?.customScenario?.capacity ?? null;
+  const maxPerTour = Number(round?.payload?.vrpMaxRoute ?? 0);
 
   const lines = (() => {
     if (mode === "sp") {
@@ -1803,20 +1943,19 @@ function RoundStatus({ round }) {
       return [
         "TSP: start at S, visit every node exactly once, return to S.",
         round.distanceMetric === "manhattan"
-        ? "Distances are Rectilinear (Manhattan). No revisits (except final S)."
-        : "Distances are Euclidean. No revisits (except final S).",
-
+          ? "Distances are Rectilinear (Manhattan). No revisits (except final S)."
+          : "Distances are Euclidean. No revisits (except final S).",
         "See the Leg Distances panel below the map.",
         "Submit only when tour is complete.",
       ];
     }
     if (mode === "vrp") {
       return [
-        `VRP: serve all customers. Capacity Q = ${cap}.`,
-        "Each customer’s demand is shown as d:x next to the node.",
-        "Click customers in sequence; click S anytime to return and reset load.",
-        "App auto-splits routes when capacity would overflow.",
-        "See current load and leg distances below the map.",
+        `VRP: you start at the depot S with truck capacity Q = ${cap}.`,
+        "Each customer node has a demand d:x that you must deliver from the truck.",
+        "Click customers in sequence to deliver, click S anytime to return and reload to full capacity.",
+        `Max distance per tour (S→…→S): ${maxPerTour > 0 ? maxPerTour : "no limit"} and it is enforced on each subtour.`,
+        "Use the Distance Matrix and the load/leg panels below the map to plan feasible tours.",
         "Submit after all customers are served and you're back at S.",
       ];
     }
@@ -1848,9 +1987,11 @@ function RoundStatus({ round }) {
             {round.isOpen ? "OPEN" : "CLOSED"}
           </div>
           {left !== null && round.isOpen && (
-            <div className={`mt-1 font-bold tabular-nums ${
-              left <= 10 ? "text-red-400" : left <= 30 ? "text-yellow-300" : "text-slate-200"
-            }`}>
+            <div
+              className={`mt-1 font-bold tabular-nums ${
+                left <= 10 ? "text-red-400" : left <= 30 ? "text-yellow-300" : "text-slate-200"
+              }`}
+            >
               {left}s left
             </div>
           )}
@@ -1859,6 +2000,7 @@ function RoundStatus({ round }) {
     </div>
   );
 }
+
 
 
 // ------------------ Manual Shortest-Path Builder ------------------
@@ -2228,13 +2370,27 @@ function TsCostTables({ scenario }) {
     </div>
   );
 }
-
 function MapPreview({ scenario }) {
   const hasGraph = Array.isArray(scenario?.nodes) && scenario.nodes.length > 0;
+
+  // VRP detector
+  const isVRP = !!scenario &&
+                typeof scenario.capacity === "number" &&
+                scenario.demand && typeof scenario.demand === "object";
+
+  const [metric, setMetric] = React.useState("euclid"); // "euclid" | "manhattan"
+  const nodes = scenario?.nodes || [];
+  const id2label = React.useMemo(() => new Map(nodes.map(n => [n.id, n.label || n.id])), [nodes]);
+
+  function dist(a, b) {
+    const dx = Math.abs(a.x - b.x), dy = Math.abs(a.y - b.y);
+    return metric === "manhattan" ? dx + dy : Math.hypot(dx, dy);
+  }
+
+  // Non-graph scenarios (TP/TS) keep the cost tables
   if (!hasGraph) {
     const isTP = Array.isArray(scenario?.supplies) && Array.isArray(scenario?.demands) && scenario?.cost;
     const isTS = Array.isArray(scenario?.supplies) && Array.isArray(scenario?.hubs) && Array.isArray(scenario?.demands) && Array.isArray(scenario?.arcs);
-
     return (
       <div className="p-4 text-sm space-y-3">
         <div>
@@ -2242,40 +2398,98 @@ function MapPreview({ scenario }) {
           {scenario?.supplies && (
             <div className="mb-2">
               <div className="font-medium">Supplies</div>
-              <ul className="list-disc ml-5">
-                {scenario.supplies.map(s => <li key={s.id}>{(s.label||s.id)}: {s.supply}</li>)}
-              </ul>
+              <ul className="list-disc ml-5">{scenario.supplies.map(s => <li key={s.id}>{(s.label||s.id)}: {s.supply}</li>)}</ul>
             </div>
           )}
           {scenario?.hubs?.length > 0 && (
             <div className="mb-2">
               <div className="font-medium">Hubs</div>
-              <ul className="list-disc ml-5">
-                {scenario.hubs.map(h => <li key={h.id}>{h.label||h.id}</li>)}
-              </ul>
+              <ul className="list-disc ml-5">{scenario.hubs.map(h => <li key={h.id}>{h.label||h.id}</li>)}</ul>
             </div>
           )}
           {scenario?.demands && (
             <div className="mb-2">
               <div className="font-medium">Demands</div>
-              <ul className="list-disc ml-5">
-                {scenario.demands.map(d => <li key={d.id}>{(d.label||d.id)}: {d.demand}</li>)}
-              </ul>
+              <ul className="list-disc ml-5">{scenario.demands.map(d => <li key={d.id}>{(d.label||d.id)}: {d.demand}</li>)}</ul>
             </div>
           )}
         </div>
-
         {isTP && <TpCostHeatmap scenario={scenario} />}
         {isTS && <TsCostTables scenario={scenario} />}
       </div>
     );
   }
+
+  // Graph scenarios: add a grid background and the map
+  const GRID = 40; // px per grid cell (aligns with pixel-based distances)
   return (
-    <div className="overflow-hidden rounded-xl bg-black/20 border border-white/10">
+    <div
+      className="overflow-hidden rounded-xl border border-white/10 relative"
+      style={{
+        backgroundImage:
+          `linear-gradient(to right, rgba(255,255,255,0.06) 1px, transparent 1px),
+           linear-gradient(to bottom, rgba(255,255,255,0.06) 1px, transparent 1px)`,
+        backgroundSize: `${GRID}px ${GRID}px, ${GRID}px ${GRID}px`,
+        backgroundColor: "rgba(0,0,0,0.2)"
+      }}
+    >
+      <div className="absolute top-2 left-3 text-[11px] bg-black/40 rounded px-2 py-1">
+        grid = {GRID}px. Euclid/Manhattan both use node pixel coordinates
+      </div>
+
       <SvgMap scenario={scenario} readonly />
+
+      {isVRP && nodes.length > 1 && (
+        <div className="border-t border-white/10 bg-white/5 p-4">
+          <div className="flex items-center justify-between mb-2">
+            <div className="font-semibold">VRP Distance Matrix</div>
+            <div className="flex items-center gap-2 text-xs">
+              <span className="text-slate-300">Metric</span>
+              <button
+                onClick={() => setMetric("euclid")}
+                className={`px-2 py-1 rounded ${metric === "euclid" ? "bg-indigo-600" : "bg-white/10 hover:bg-white/20"}`}
+                title="Straight-line distance"
+              >Euclidean</button>
+              <button
+                onClick={() => setMetric("manhattan")}
+                className={`px-2 py-1 rounded ${metric === "manhattan" ? "bg-indigo-600" : "bg-white/10 hover:bg-white/20"}`}
+                title="Grid/orthogonal distance"
+              >Manhattan</button>
+            </div>
+          </div>
+
+          <div className="rounded-lg border border-white/10 overflow-auto">
+            <table className="min-w-[640px] text-xs md:text-sm">
+              <thead>
+                <tr>
+                  <th className="px-2 py-1 text-left">From ↓ / To →</th>
+                  {nodes.map(n => <th key={n.id} className="px-2 py-1 text-left whitespace-nowrap">{id2label.get(n.id)}</th>)}
+                </tr>
+              </thead>
+              <tbody>
+                {nodes.map(ni => (
+                  <tr key={ni.id} className="border-t border-white/5">
+                    <td className="px-2 py-1 font-medium whitespace-nowrap">{id2label.get(ni.id)}</td>
+                    {nodes.map(nj => (
+                      <td key={nj.id} className="px-2 py-1 text-center">
+                        {ni.id === nj.id ? "—" : dist(ni, nj).toFixed(1)}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="text-[11px] md:text-xs text-slate-300 mt-2">
+            use this with your max distance per tour setting
+          </div>
+        </div>
+      )}
     </div>
   );
 }
+
 
 
 
@@ -2320,7 +2534,16 @@ function ClosedCard() {
 
 function Leaderboards({ room, round }) {
   const [season, setSeason] = useState({ totals: {}, history: [] });
-  useEffect(() => { (async () => setSeason(await loadSeason(room) || { totals: {}, history: [] }))(); }, [room, round?.id]);
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const s = await loadSeason(room) || { totals: {}, history: [] };
+      if (alive) setSeason(s);
+    })();
+    // Refresh whenever a round opens/closes/scores/reveals
+    return () => { alive = false; };
+  }, [room, round?.id, round?.isOpen, round?.scored, round?.revealBoard]);
 
   const hasRound = !!round;
 
@@ -2332,14 +2555,19 @@ function Leaderboards({ room, round }) {
       </div>
     </div>
   );
-
 }
 
 function RoundLeaderboardCard({ room, round }) {
+  const [nameMap, setNameMap] = React.useState({});
+  React.useEffect(() => { (async () => setNameMap(await loadDisplayNameMap(room)))(); }, [room]);
+
   const s = getScenarioFromRound(round);
   const scenarioTitle = s?.title ?? "—";
 
-  const entries = Object.entries(round.players || {}).map(([name, r]) => ({ name, ...r }));
+  // map usernames → display_name before ranking
+  const entries = Object.entries(round.players || {}).map(([u, r]) => ({
+    name: nameMap[u] || u, ...r
+  }));
   entries.sort((a, b) => (a.cost - b.cost) || (a.timeSec - b.timeSec));
 
   const ranked = [];
@@ -2351,32 +2579,21 @@ function RoundLeaderboardCard({ room, round }) {
     prevCost = e.cost; prevTime = e.timeSec;
   }
 
-  // Never spread a possibly-null scenario
   const sNorm = (s && Array.isArray(s.nodes))
     ? s
     : { nodes: [], edges: [], start: "S", end: "T", objective: "time", title: scenarioTitle };
 
   const { graphEdges } = useWeightedScenario(sNorm, round);
-
-  // If some solver helpers aren’t defined yet, don’t crash
   const safeCall = (fn, ...args) => (typeof fn === "function" ? fn(...args) : { cost: Infinity, path: [] });
 
   const opt = React.useMemo(() => {
     switch (round.gameMode) {
-      case "sp":
-        if (!sNorm.nodes.length) return { cost: Infinity, path: [] };
-        return dijkstra(sNorm.nodes, graphEdges, sNorm.start, sNorm.end);
-      case "tsp":
-        return safeCall(tspOptimalCost, sNorm.nodes || []);
-      case "vrp":
-        return safeCall(vrpOptimalCost, sNorm);
-      case "tp":
-        return { path: [], cost: safeCall(tpOptimalCost, sNorm).cost };
-      case "ts":
-        return { path: [], cost: safeCall(tsOptimalCost, sNorm).cost };
-      case "pick":
-      default:
-        return safeCall(pickOptimalCost, sNorm);
+      case "sp":  return sNorm.nodes.length ? dijkstra(sNorm.nodes, graphEdges, sNorm.start, sNorm.end) : { cost: Infinity, path: [] };
+      case "tsp": return safeCall(tspOptimalCost, sNorm.nodes || []);
+      case "vrp": return safeCall(vrpOptimalCost, sNorm);
+      case "tp":  return { path: [], cost: safeCall(tpOptimalCost, sNorm).cost };
+      case "ts":  return { path: [], cost: safeCall(tsOptimalCost, sNorm).cost };
+      default:    return safeCall(pickOptimalCost, sNorm);
     }
   }, [round.gameMode, sNorm, graphEdges]);
 
@@ -2408,9 +2625,7 @@ function RoundLeaderboardCard({ room, round }) {
                 <div className="text-xs text-slate-300">Objective {fmt(e.cost ?? e.timeSec)} • Time {e.timeSec ?? "—"}s</div>
               </div>
             </div>
-            <div className="text-right text-xs">
-              <div>Season points: {e.seasonPts}</div>
-            </div>
+            <div className="text-right text-xs">Season points: {e.seasonPts}</div>
           </div>
         ))}
       </div>
@@ -2419,6 +2634,8 @@ function RoundLeaderboardCard({ room, round }) {
     </div>
   );
 }
+
+
 
 
 function SeasonLeaderboardCard({ room, season }) {
@@ -2503,12 +2720,24 @@ function safeCall(fn, fallback, ...args) {
   catch { return fallback; }
 }
 
+
+// Get scenario from payload or registry (works for TP/TS too)
 // Get scenario from payload or registry (works for TP/TS too)
 function scenarioFromPayload(payload) {
   if (!payload) return null;
+  if (payload.snapshotScenario) return payload.snapshotScenario;
   if (payload.customScenario) return payload.customScenario;
-  return findScenarioById(payload.scenarioId) || null;
+  const byId = findScenarioById(payload.scenarioId);
+  if (byId) return byId;
+
+  const mode = payload.gameMode || payload.mode;
+  if (mode === "tsp" && tspPresets.length) return tspPresets[0];
+  if (mode === "vrp" && vrpPresets.length) return vrpPresets[0];
+  if (mode === "tp"  && tpPresets.length)  return tpPresets[0];
+  if (mode === "ts"  && tsPresets.length)  return tsPresets[0];
+  return null;
 }
+
 
 // Compute an "optimal" for a past round (all modes) with safety
 function computeOptimalForPayload(scenario, payload, modeHint) {
@@ -2766,7 +2995,9 @@ async function openHistoryRound(row) {
 
                       <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
                         <div className="lg:col-span-2 rounded-lg overflow-hidden border border-emerald-300/20">
+                        <MapGridFrame>
                           <SvgMap scenario={scenario} round={payload} path={selPlayer?.path || []} optPath={best.path} readonly />
+                        </MapGridFrame>
 
                         </div>
                         <div className="rounded-lg border border-emerald-300/20 p[2px] p-2">
@@ -3192,16 +3423,28 @@ setSubmitted(true);
 
         <div className="overflow-hidden rounded-xl bg-black/20 border border-white/10">
           {Array.isArray(scenario?.nodes) && scenario.nodes.length > 0 ? (
-            <SvgMap
-              scenario={scenario}
-              round={round}
-              path={path}
-              onClickNode={onClickNode}
-              hintLines={round.gameMode === "tsp" ? tspHintLines : []}
-            />
-          ) : (
-            <MapPreview scenario={scenario} />
-          )}
+              <>
+                <MapGridFrame>
+                  <SvgMap
+                    scenario={scenario}
+                    round={round}
+                    path={path}
+                    onClickNode={onClickNode}
+                    hintLines={round.gameMode === "tsp" ? tspHintLines : []}
+                  />
+                </MapGridFrame>
+
+                {(round.gameMode === "tsp" || round.gameMode === "vrp") && (
+                  <NodeDistanceMatrix
+                    scenario={scenario}
+                    metric={round?.payload?.distanceMetric || "euclid"}
+                  />
+                )}
+              </>
+            ) : (
+              <MapPreview scenario={scenario} />
+            )}
+
         </div>
 
 
@@ -3320,6 +3563,59 @@ setSubmitted(true);
 }
 
 
+function MapGridFrame({ children }) {
+  const CELL = 40;
+  return (
+    <div
+      className="overflow-hidden rounded-xl border border-white/10 relative"
+      style={{
+        backgroundImage:
+          `linear-gradient(to right, rgba(255,255,255,0.06) 1px, transparent 1px),
+           linear-gradient(to bottom, rgba(255,255,255,0.06) 1px, transparent 1px)`,
+        backgroundSize: `${CELL}px ${CELL}px, ${CELL}px ${CELL}px`,
+        backgroundColor: "rgba(0,0,0,0.2)"
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+function NodeDistanceMatrix({ scenario, metric = "euclid" }) {
+  const nodes = scenario?.nodes || [];
+  if (nodes.length < 2) return null;
+
+  const id2label = React.useMemo(() => new Map(nodes.map(n => [n.id, n.label || n.id])), [nodes]);
+  const dist = (a, b) => {
+    const dx = Math.abs(a.x - b.x), dy = Math.abs(a.y - b.y);
+    return metric === "manhattan" ? dx + dy : Math.hypot(dx, dy);
+  };
+
+  return (
+    <div className="mt-3 rounded-lg border border-white/10 overflow-auto">
+      <div className="px-2 py-1 text-xs font-semibold bg-white/5">Node-to-node distance (metric: {metric})</div>
+      <table className="min-w-[640px] text-xs md:text-sm">
+        <thead>
+          <tr>
+            <th className="px-2 py-1 text-left">From ↓ / To →</th>
+            {nodes.map(n => <th key={n.id} className="px-2 py-1 text-left whitespace-nowrap">{id2label.get(n.id)}</th>)}
+          </tr>
+        </thead>
+        <tbody>
+          {nodes.map(ni => (
+            <tr key={ni.id} className="border-t border-white/5">
+              <td className="px-2 py-1 font-medium whitespace-nowrap">{id2label.get(ni.id)}</td>
+              {nodes.map(nj => (
+                <td key={nj.id} className="px-2 py-1 text-center">
+                  {ni.id === nj.id ? "—" : dist(ni, nj).toFixed(1)}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
 
 
 
@@ -3647,6 +3943,19 @@ function useRound(room) {
 
 
 
+function attachPointsAndRanks(round) {
+  const standings = computeStandings(round); // already sorts by cost, then timeSec
+  const rankByName = new Map(standings.map(r => [r.name, r.rank]));
+  const ptsByName  = new Map(standings.map(r => [r.name, Math.max(0, 24 - r.rank)]));
+
+  const players = {};
+  for (const [name, p] of Object.entries(round.players || {})) {
+    const rank = rankByName.get(name) ?? null;
+    const points = ptsByName.get(name) ?? 0;
+    players[name] = { ...p, rank, points };
+  }
+  return { ...round, players, standings }; // include standings for convenience
+}
 
 
 
@@ -4087,36 +4396,73 @@ function vrpAllCustomersSelected(path, scenario){
   for (const id of cust) if (!path.includes(id)) return false;
   return true;
 }
-function vrpRouteCostFromSequence(seq, { scenario, nodes }) {
-  const D = metricFnFor(scenario);
-  const map = nodeByIdMap(nodes);
-  const cap = Number(scenario.capacity) || 8;
-  const demand = scenario.demand || {};
-  let cost = 0;
-  let cur = "S";
-  let load = cap; // start full at depot
+function vrpRouteCostFromSequence(sequence, ctx) {
+  const scn = ctx?.scenario || {};
+  const depot = scn.start || "S";
+  const nodes = ctx?.nodes || scn.nodes || [];
+  const capacity = Number(scn.capacity || 0);
+  const demand = scn.demand || {};
+  const metric = (ctx?.distanceMetric || "euclid").toLowerCase();
+  const maxPerTour = Number(ctx?.vrpMaxRoute ?? 0); // 0 = no limit
+
+  const map = new Map(nodes.map(n => [n.id, n]));
+  const dNeed = (id) => Number(demand[id] || 0);
+  const dist = (a, b) => {
+    const A = typeof a === "string" ? map.get(a) : a;
+    const B = typeof b === "string" ? map.get(b) : b;
+    if (!A || !B) return Infinity;
+    const dx = Math.abs(A.x - B.x), dy = Math.abs(A.y - B.y);
+    return metric === "manhattan" ? dx + dy : Math.hypot(dx, dy);
+  };
+
+  if (!Array.isArray(sequence) || sequence.length < 2) return null;
+
+  // Ensure starts/ends at depot
+  let seq = sequence.slice();
+  if (seq[0] !== depot) seq = [depot, ...seq];
+  if (seq[seq.length - 1] !== depot) seq = [...seq, depot];
+
+  let tourDist = 0, totalDist = 0, load = 0, prev = depot;
 
   for (let i = 1; i < seq.length; i++) {
-    const next = seq[i];
-    if (next === "S") {
-      cost += D(map[cur], map["S"]);
-      cur = "S";
-      load = cap; // reload to full
+    const cur = seq[i];
+    tourDist += dist(prev, cur);
+
+    if (cur === depot) {
+      if (maxPerTour > 0 && tourDist > maxPerTour + 1e-9) return null;
+      totalDist += tourDist;
+      tourDist = 0;
+      load = 0; // reload to full
+      prev = depot;
       continue;
     }
-    const dem = demand[next] || 1;
-    if (load < dem) {
-      cost += D(map[cur], map["S"]);
-      cur = "S";
-      load = cap;
+
+    const need = dNeed(cur);
+    if (!Number.isFinite(need) || need < 0) return null;
+
+    if (capacity > 0 && load + need > capacity) {
+      // close current subtour back to depot and check limit
+      tourDist += dist(prev, depot);
+      if (maxPerTour > 0 && tourDist > maxPerTour + 1e-9) return null;
+      totalDist += tourDist;
+
+      // start a new subtour S -> cur
+      tourDist = dist(depot, cur);
+      load = 0;
     }
-    cost += D(map[cur], map[next]);
-    cur = next;
-    load -= dem; // deliver
+    load += need;
+    prev = cur;
   }
-  if (cur !== "S") cost += D(map[cur], map["S"]);
-  return cost;
+
+  if (tourDist > 0) {
+    tourDist += dist(prev, depot);
+    if (maxPerTour > 0 && tourDist > maxPerTour + 1e-9) return null;
+    totalDist += tourDist;
+  }
+
+  return Number.isFinite(totalDist) ? totalDist : null;
 }
+
 
 // vrpBaselineCost - robust version (greedy heuristic)
 function vrpBaselineCost(scenario) {
@@ -4310,7 +4656,7 @@ function computeLegsVrp(path, scenario, metric){
   }
   return out;
 }
-import { supabase } from "./lib/supabase";
+
 
 // --- Auth (roster) ---
 async function verifyStudent(room, username, pin) {
@@ -4571,21 +4917,37 @@ function nodeByIdMap(nodes) {
   return Object.fromEntries((nodes || []).map(n => [n.id, n]));
 }
 
-function computeOptimalForRound(scenario, round, graphEdges) {
-  if (!scenario?.nodes?.length) return { path: [], cost: Infinity };
-  switch (round?.gameMode) {
-    case "sp":
-      return dijkstra(scenario.nodes, graphEdges, scenario.start, scenario.end);
-    case "tsp":
-  return tspBaselineCost(scenario, round?.tspOpt || "nn", round);
-    case "vrp":
-  return vrpClarkeWright(scenario, round);
+function computeOptimalForRound(round) {
+  const s = getScenarioFromRound(round) || {};
+  const { graphEdges } = { graphEdges: buildGraphEdges(s, round) };
 
-    case "pick":
-    default:
-      return pickBaselineCost(scenario);
+  function safe(fn, ...args) {
+    try { return fn(...args); } catch { return { cost: Infinity, path: [] }; }
+  }
+
+  switch (round.gameMode) {
+    case "sp":
+      if (!Array.isArray(s.nodes) || !s.nodes.length) return { cost: Infinity, path: [] };
+      return dijkstra(s.nodes, graphEdges, s.start, s.end);
+    case "tsp": return safe(tspOptimalCost, s.nodes || []);
+    case "vrp": return safe(vrpOptimalCost, s);
+    case "tp":  return safe(tpOptimalCost, s);            // { cost, flows }
+    case "ts":  return safe(tsOptimalCost, s);            // { cost, flows }
+    default:    return safe(pickOptimalCost, s);
   }
 }
+
+
+function loadHistory(room) {
+  const s = loadStore();
+  return s["history:" + room] || [];
+}
+function saveHistory(room, list) {
+  const s = loadStore();
+  s["history:" + room] = list;
+  saveStore(s);
+}
+
 
 // scenario: { nodes, start, end, ... }, round: payload with gameMode/objectives, path: [ids], graphEdges?: weighted edges for SP
 function computePathCost(scenario, round, path, graphEdges = null) {
