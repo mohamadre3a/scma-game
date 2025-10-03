@@ -774,20 +774,24 @@ function findScenarioById(id) {
 
 function getScenarioFromRound(round) {
   if (!round) return null;
-  const p = round.payload || {};
 
-  // 1) Most reliable: frozen snapshot saved at round open
-  const snap = p.snapshotScenario || round.snapshotScenario;
-  if (snap && (Array.isArray(snap.nodes) || Array.isArray(snap.supplies))) return snap;
+  const payload = round.payload || {};
+  // Accept both camelCase (client) and snake_case (DB)
+  const snap =
+    payload.snapshotScenario ||
+    round.snapshotScenario ||
+    round.snapshotscenario ||
+    null;
 
-  // 2) Custom inline (explicit)
-  if (p.customScenario) return p.customScenario;
+  if (snap && (Array.isArray(snap.nodes) || Array.isArray(snap.supplies))) {
+    return snap;
+  }
 
-  // 3) Explicit preset by id
-  const preset = findScenarioById(p.scenarioId);
-  if (preset) return preset;
+  // Fallback to whatever is inside payload if no frozen snapshot exists
+  if (payload && (Array.isArray(payload.nodes) || Array.isArray(payload.supplies))) {
+    return payload;
+  }
 
-  // 4) Otherwise, do NOT guess — return null so UI shows "scenario unavailable".
   return null;
 }
 
@@ -886,73 +890,48 @@ function dijkstra(nodes, edges, start, end) {
 // -----------------------------
 // Local Storage Store (rounds, season, roster)
 // -----------------------------
-const LS_KEY = "scma-dash-store";
-function loadStore() { try { return JSON.parse(localStorage.getItem(LS_KEY) || "{}"); } catch { return {}; } }
-function saveStore(data) { localStorage.setItem(LS_KEY, JSON.stringify(data)); }
+const LS_KEY = null;
+function loadStore() { return {}; }
+function saveStore(_data) { /* no-op: no local persistence */ }
 
 // Async load/save now use Supabase. Keep simple local cache for fast UI.
 async function loadRoomRound(room) {
-  const key = `scma_round_${room}`;
-
-  // Treat us as offline if any of these are true
-  const offline =
-    localStorage.getItem("scma_supa_offline") === "1" ||
-    typeof window === "undefined" ||
-    typeof supabase === "undefined" ||
-    typeof dbLoadCurrentRound !== "function";
-
-  // Read cache
-  let cached = null;
+  if (typeof supabase === "undefined") return null;
   try {
-    const cachedStr = localStorage.getItem(key);
-    cached = cachedStr ? JSON.parse(cachedStr) : null;
-  } catch {
-    cached = null;
-  }
+    const { data: round, error } = await supabase
+      .from("rounds")
+      .select("*")
+      .eq("room", room)
+      .eq("is_open", true)
+      .order("started_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error) throw error;
+    if (!round) return null;
 
-  // If we have an OPEN cached round, prefer it for immediate UX
-  if (cached?.isOpen) {
-    // Opportunistic refresh only when online and helper exists
-    if (!offline) {
-      try {
-        const fresh = await dbLoadCurrentRound(room);
-        if (fresh) {
-          const cStart = cached?.startedAt ?? 0;
-          const fStart = fresh?.startedAt ?? 0;
-          // Only overwrite if the server copy is the same round or newer
-          if (fStart >= cStart) {
-            localStorage.setItem(key, JSON.stringify(fresh));
-          }
-        } else {
-          // Server says no open round → force-close the cached one
-          const closed = { ...cached, isOpen: false, endsAt: cached?.endsAt || Date.now() };
-          localStorage.setItem(key, JSON.stringify(closed));
-        }
-      } catch {
-        // swallow; stay on cached
-      }
+    const r = _rowToRound(round);
+
+    const { data: subs } = await supabase
+      .from("submissions")
+      .select("username, cost, time_sec, score, path, submitted_at")
+      .eq("round_id", r.id);
+
+    r.players = {};
+    for (const s of subs || []) {
+      r.players[s.username] = {
+        cost: s.cost != null ? Number(s.cost) : undefined,
+        timeSec: s.time_sec != null ? Number(s.time_sec) : undefined,
+        score: s.score != null ? Number(s.score) : undefined,
+        path: s.path || null,
+        submittedAt: s.submitted_at || null,
+      };
     }
-    return cached;
-  }
-
-  // If we’re in a closed/reveal state, keep showing cached leaderboard
-  if (cached?.revealBoard) return cached;
-
-  // Otherwise clear stale cache
-  localStorage.removeItem(key);
-
-  // If offline or the DB helper isn't present, we can't fetch a fresh round
-  if (offline) return null;
-
-  // Try fetching the current open round
-  try {
-    const fresh = await dbLoadCurrentRound(room);
-    if (fresh) localStorage.setItem(key, JSON.stringify(fresh));
-    return fresh || null;
+    return r;
   } catch {
     return null;
   }
 }
+
 
 async function dbLoadCurrentRoundRow(room) {
   const { data, error } = await supabase
@@ -969,26 +948,11 @@ async function dbLoadCurrentRoundRow(room) {
 
 
 async function saveRoomRound(room, round) {
-  const key = `scma_round_${room}`;
-  try {
-    if (!round) {
-      localStorage.removeItem(key);
-      if (typeof dbSaveRound === "function") {
-        await dbSaveRound(room, null);
-      }
-      return;
-    }
-    let merged = { ...round };
-    if (typeof dbSaveRound === "function") {
-      const row = await dbSaveRound(room, round);
-      if (row?.id) merged = { ...round, id: row.id };
-    }
-    localStorage.setItem(key, JSON.stringify(merged));
-  } catch {
-    // Fallback to local-only cache
-    if (round) localStorage.setItem(key, JSON.stringify(round));
-  }
+  if (!round) return;
+  const row = await dbSaveRound(room, round);
+  if (row?.id && !round.id) round.id = row.id;
 }
+
 
 
 
@@ -1130,15 +1094,184 @@ async function applySeasonPoints(room, round, standings) {
 
 function saveSeason(room, season) { const s = loadStore(); s["season:" + room] = season; saveStore(s); }
 
-function addToRoster(room, name) {
-  const s = loadStore();
-  const key = "roster:" + room;
-  const roster = new Set(s[key] || []);
-  roster.add(name);
-  s[key] = Array.from(roster);
-  saveStore(s);
+async function addToRoster(room, username, display_name = null) {
+  const { error } = await supabase
+    .from("roster")
+    .upsert({ room, username, display_name }, { onConflict: "room,username" });
+  if (error) throw error;
 }
-function loadRoster(room) { const s = loadStore(); return s["roster:" + room] || []; }
+
+async function loadRoster(room) {
+  const { data, error } = await supabase
+    .from("roster")
+    .select("username")
+    .eq("room", room)
+    .order("username", { ascending: true });
+  if (error) throw error;
+  return (data || []).map(r => r.username);
+}
+
+// ===================== DB HELPERS (DB-only; no local storage) =====================
+
+function _rowToRound(row) {
+  if (!row) return null;
+  const payload = row.payload || {};
+  const snapshotScenario = row.snapshotscenario || payload.snapshotScenario || null;
+
+  return {
+    id: row.id,
+    room: row.room,
+    gameMode: row.game_mode || payload.gameMode || null,
+    payload,
+    snapshotScenario,
+    snapshotscenario: snapshotScenario,
+    isOpen: !!row.is_open,
+    revealBoard: !!row.reveal_board,
+    scored: !!row.scored,
+    startedAt: row.started_at ? new Date(row.started_at).getTime() : null,
+    endsAt: row.ends_at ? new Date(row.ends_at).getTime() : null,
+    endedAt: row.ended_at ? new Date(row.ended_at).getTime() : null,
+  };
+}
+
+async function dbSaveRound(room, round) {
+  if (!round) return null;
+
+  const row = {
+    id: round.id,
+    room,
+    game_mode: round.gameMode || round.payload?.gameMode || null,
+    payload: round.payload || {},
+    snapshotscenario: round.snapshotScenario || round.snapshotscenario || null,
+    is_open: !!round.isOpen,
+    reveal_board: !!round.revealBoard,
+    scored: !!round.scored,
+    started_at: round.startedAt ? new Date(round.startedAt).toISOString() : null,
+    ends_at: round.endsAt ? new Date(round.endsAt).toISOString() : null,
+    ended_at: round.endedAt ? new Date(round.endedAt).toISOString() : null,
+  };
+
+  const { data, error } = await supabase
+    .from("rounds")
+    .upsert(row, { onConflict: "id", ignoreDuplicates: false })
+    .select()
+    .maybeSingle();
+
+  if (error) throw error;
+  return data;
+}
+
+async function dbSaveSnapshotScenario(roundId, snapshotScenario) {
+  const { error } = await supabase
+    .from("rounds")
+    .update({ snapshotscenario: snapshotScenario })
+    .eq("id", roundId);
+  if (error) throw error;
+}
+
+async function dbSaveSubmission(roundId, username, { cost, timeSec, score, path }) {
+  const row = {
+    round_id: roundId,
+    username,
+    cost: cost != null ? Number(cost) : null,
+    time_sec: timeSec != null ? Math.round(Number(timeSec)) : null,
+    score: score != null ? Number(score) : null,
+    path: path || null,
+    submitted_at: new Date().toISOString(),
+  };
+  const { error } = await supabase
+    .from("submissions")
+    .upsert(row, { onConflict: "round_id,username" });
+  if (error) throw error;
+}
+
+// Basic Dijkstra fallback (cost-weighted) to compute optimal if you don't already compute it elsewhere
+function _computeOptimalBasic(scn) {
+  if (!scn || !Array.isArray(scn.nodes) || !Array.isArray(scn.edges)) return null;
+  const start = scn.start ?? scn.source ?? scn.begin ?? null;
+  const end = scn.end ?? scn.target ?? scn.finish ?? null;
+  if (start == null || end == null) return null;
+
+  const adj = new Map();
+  for (const e of scn.edges) {
+    const u = e.from ?? e.u ?? e.source;
+    const v = e.to ?? e.v ?? e.target;
+    const w = Number(e.cost ?? e.weight ?? e.w ?? 1);
+    if (!adj.has(u)) adj.set(u, []);
+    adj.get(u).push([v, w]);
+    // if undirected, also push reverse; leave directed by default
+  }
+
+  const dist = new Map(), prev = new Map();
+  const Q = new Set(scn.nodes.map(n => (typeof n === "object" ? n.id : n)));
+  for (const n of Q) dist.set(n, Infinity);
+  dist.set(start, 0);
+
+  while (Q.size) {
+    let u = null, best = Infinity;
+    for (const x of Q) { const d = dist.get(x) ?? Infinity; if (d < best) { best = d; u = x; } }
+    if (u == null) break;
+    Q.delete(u);
+    if (u === end) break;
+    const nbrs = adj.get(u) || [];
+    for (const [v, w] of nbrs) {
+      if (!Q.has(v)) continue;
+      const nd = (dist.get(u) ?? Infinity) + w;
+      if (nd < (dist.get(v) ?? Infinity)) {
+        dist.set(v, nd);
+        prev.set(v, u);
+      }
+    }
+  }
+
+  if (!prev.has(end) && start !== end) return { path: [], cost: null };
+  const path = [];
+  let cur = end;
+  path.push(cur);
+  while (cur !== start) {
+    cur = prev.get(cur);
+    if (cur == null) break;
+    path.push(cur);
+  }
+  path.reverse();
+  return { path, cost: Number.isFinite(dist.get(end)) ? dist.get(end) : null };
+}
+
+async function dbComputeAndPersistOptimal(round) {
+  const scn = getScenarioFromRound(round);
+  if (!scn) return;
+  const res = _computeOptimalBasic(scn);
+  if (!res) return;
+
+  const payload = { ...(round.payload || {}) };
+  payload.optimal = {
+    path: Array.isArray(res.path) ? res.path : [],
+    cost: Number.isFinite(res.cost) ? res.cost : null,
+    computedAt: new Date().toISOString(),
+  };
+
+  const { error } = await supabase
+    .from("rounds")
+    .update({ payload })
+    .eq("id", round.id);
+  if (error) throw error;
+}
+
+// Update points for a user's submission (used by instructor finalize)
+async function dbUpdateSubmissionPoints(roundId, username, points) {
+  await supabase.from("submissions")
+    .upsert(
+      { round_id: roundId, username, score: Number(points) },
+      { onConflict: "round_id,username" }
+    );
+}
+
+// Wipe season totals for a room
+async function dbResetSeason(room) {
+  await supabase.from("season_totals").delete().eq("room", room);
+}
+
+
 
 // -----------------------------
 // Root App
@@ -1150,24 +1283,24 @@ export default function App() {
   const [room, setRoom] = useState("SCMA");
 
   useEffect(() => {
-    const s = loadStore();
-    if (s.me) { setMe(s.me); setRoom(s.me.room); }
-  }, []);
+  // no local restore; identity comes from this session only
+}, []);
+
 
   const onJoin = (name, roomCode) => {
-    const s = loadStore();
-    s.me = { name, room: roomCode.toUpperCase() };
-    saveStore(s);
-    addToRoster(roomCode.toUpperCase(), name);
-    setMe(s.me);
-  };
+  const next = { name, room: roomCode.toUpperCase() };
+  addToRoster(next.room, next.name);
+  setMe(next);
+  setRoom(next.room);
+};
+
 
   const onLeave = () => {
-  const s = loadStore();
-  delete s.me; saveStore(s);
-  localStorage.removeItem("scma_me"); // also clear PIN login memory
-  setMe(null); setRole("player"); setPinOk(false);
+  setMe(null);
+  setRole("player");
+  setPinOk(false);
 };
+
 
 
   return (
@@ -1178,12 +1311,11 @@ export default function App() {
         {!me ? (
           <LoginGate
             onLogin={(profile) => {
-              const s = loadStore();
-              s.me = { name: profile.name, room: profile.room };
-              saveStore(s);
-              setMe(s.me);
-              setRoom(s.me.room);
+              const next = { name: profile.name, room: profile.room };
+              setMe(next);
+              setRoom(next.room);
             }}
+
           />
         ) : role === "instructor" && pinOk ? (
           <InstructorPanel room={me.room} />
@@ -1361,60 +1493,38 @@ const [vrpMaxRoute, setVrpMaxRoute] = useState(0);      // 0 = no limit, per-tou
   const [countdownSec, setCountdownSec] = useState(90);
 
   // Auto-score once a round is closed
-   // Auto-award points once a round is closed (no "score", only points)
+// Auto-award points once a round is closed (DB-only; no local history)
 useEffect(() => {
   if (round && !round.isOpen && !round.scored) {
     (async () => {
-      let r2 = attachPointsAndRanks({ ...round });
+      // Your function that builds standings: keep it if you have it, otherwise computeStandings(round)
+      const standings = (typeof attachPointsAndRanks === "function")
+        ? (attachPointsAndRanks({ ...round }).standings || [])
+        : computeStandings(round);
 
-      const optimal = computeOptimalForRound(r2);
-      r2 = {
-        ...r2,
-        optimal: { cost: optimal.cost, path: optimal.path || [] },
-        snapshotScenario: r2.payload?.snapshotScenario || getScenarioFromRound(r2),
-      };
-
-      // ✅ write per-player results to DB (optional)
+      // Persist per-player points into submissions.score
       if (typeof dbUpdateSubmissionPoints === "function") {
-        for (const [u, p] of Object.entries(r2.players || {})) {
-          try { dbUpdateSubmissionPoints(r2.id, u, p.points ?? 0, p.rank ?? null); } catch {}
+        for (const row of standings) {
+          try {
+            const pts = Math.max(0, 24 - (row.rank ?? 999));
+            await dbUpdateSubmissionPoints(round.id, row.name, pts);
+          } catch {}
         }
       }
 
-      // (You can remove this if you go full DB for season)
-      applySeasonPoints(room, r2, r2.standings, roster);
+      // Optional: update season_totals (absolute points, DB table)
+      try { await applySeasonPoints(room, round, standings); } catch {}
 
-      // ✅ save history with display_name
-      const nameMap = await loadDisplayNameMap(room);
-      const hist = loadHistory(room);
-      hist.unshift({
-        id: r2.id,
-        room,
-        gameMode: r2.gameMode,
-        startedAt: r2.startedAt,
-        endedAt: r2.endsAt || Date.now(),
-        scenario: r2.snapshotScenario,
-        objective: {
-          mode: r2.payload?.objectiveMode || "single",
-          objA: r2.payload?.objA || r2.snapshotScenario?.objective || "time",
-          objB: r2.payload?.objB || "cost",
-          alpha: r2.payload?.alpha ?? 1,
-          distanceMetric: r2.payload?.distanceMetric || null,
-          vrpMaxRoute: r2.payload?.vrpMaxRoute || 0,
-        },
-        optimal: r2.optimal,
-        results: (r2.standings || []).map(r => ({
-          username: r.name,
-          display_name: nameMap[r.name] || r.name,
-          cost: r.cost,
-          timeSec: r.timeSec,
-          rank: r.rank,
-          points: Math.max(0, 24 - r.rank),
-        }))
-      });
-      saveHistory(room, hist.slice(0, 200));
+      // Persist the frozen scenario if not already in column
+      const snap = round.payload?.snapshotScenario || round.snapshotScenario || getScenarioFromRound(round);
+      if (snap && round.id) {
+        try { await dbSaveSnapshotScenario(round.id, snap); } catch {}
+      }
 
-      r2 = { ...r2, scored: true };
+      // Persist a computed optimal path into rounds.payload.optimal for history/replay
+      try { await dbComputeAndPersistOptimal(round); } catch {}
+
+      const r2 = { ...round, scored: true };
       await saveRoomRound(room, r2);
       setRound(r2);
     })();
@@ -1456,7 +1566,7 @@ const baseScenario =
     : makePickingScenario(pickRows, pickCols, pickCount);
 
 
-  const onOpen = async () => {
+const onOpen = async () => {
   const id = Math.random().toString(36).slice(2, 8).toUpperCase();
   const now = Date.now();
   const endsAt = countdownSec > 0 ? now + countdownSec * 1000 : null;
@@ -1476,35 +1586,13 @@ const baseScenario =
       objA, objB, alpha,
     };
   } else if (gameMode === "tsp") {
-    if (selTspScenario === "custom") {
-      payload = {
-        scenarioId: "tsp",
-        distanceMetric: distMetric,
-        tspOpt,
-        customScenario: makeTspScenario(tspNodes)
-      };
-    } else {
-      payload = {
-        scenarioId: selTspScenario,
-        distanceMetric: distMetric,
-        tspOpt
-      };
-    }
+    payload = (selTspScenario === "custom")
+      ? { scenarioId: "tsp", distanceMetric: distMetric, tspOpt, customScenario: makeTspScenario(tspNodes) }
+      : { scenarioId: selTspScenario, distanceMetric: distMetric, tspOpt };
   } else if (gameMode === "vrp") {
-    if (selVrpScenario === "custom") {
-      payload = {
-        scenarioId: "vrp",
-        distanceMetric: distMetric,
-        vrpMaxRoute,
-        customScenario: makeVrpScenario(vrpCustomers, vrpCapacity)
-      };
-    } else {
-      payload = {
-        scenarioId: selVrpScenario,
-        distanceMetric: distMetric,
-        vrpMaxRoute
-      };
-    }
+    payload = (selVrpScenario === "custom")
+      ? { scenarioId: "vrp", distanceMetric: distMetric, vrpMaxRoute, customScenario: makeVrpScenario(vrpCustomers, vrpCapacity) }
+      : { scenarioId: selVrpScenario, distanceMetric: distMetric, vrpMaxRoute };
   } else if (gameMode === "tp") {
     const scn = tpPresets.find(s => s.id === selTpScenario) || tpPresets[0];
     payload = { scenarioId: scn.id, customScenario: scn };
@@ -1515,7 +1603,7 @@ const baseScenario =
     payload = { scenarioId: "pick", customScenario: makePickingScenario(pickRows, pickCols, pickCount) };
   }
 
-  // NEW: freeze the exact scenario used so history can always render it later
+  // Freeze exactly what the class will see, for stable history replays:
   const usedScenario =
     gameMode === "sp"
       ? (payload.customScenario || ([...scenarios, ...spCalgaryPresets].find(x => x.id === selScenario)))
@@ -1537,9 +1625,17 @@ const baseScenario =
     startedAt: now, endsAt, durationSec: countdownSec, scored: false,
     gameMode,
     payload,
+    // keep top-level too for DB column convenience when we call dbSaveSnapshotScenario below
+    snapshotScenario: usedScenario || null,
   };
 
   await saveRoomRound(room, newRound);
+
+  // Also mirror the snapshot into rounds.snapshotscenario column for easy querying
+  if (newRound.snapshotScenario) {
+    try { await dbSaveSnapshotScenario(newRound.id, newRound.snapshotScenario); } catch {}
+  }
+
   setRound(newRound);
 };
 
@@ -3311,88 +3407,68 @@ if (round.gameMode === "sp") {
   pickBaselineCost(scenario).cost;
 
 async function onSubmit() {
-  if (!round || !me) return;
+  if (!round?.id || !me?.name) return;
+
   const timeSec = Math.max(0, Math.round((Date.now() - (round.startedAt || Date.now())) / 1000));
 
-  let myCost;
+  let cost;
   if (round.gameMode === "sp") {
-    myCost = Math.round(spPathCost || 0);
+    cost = Math.round(spPathCost || 0);
   } else if (round.gameMode === "tsp") {
-    myCost = Math.round(legsTsp.reduce((a,L)=>a+L.dist,0));
+    cost = Math.round(legsTsp.reduce((a, L) => a + L.dist, 0));
   } else if (round.gameMode === "vrp") {
-    myCost = Math.round(legsVrp.reduce((a,L)=>a+L.dist,0));
+    cost = Math.round(legsVrp.reduce((a, L) => a + L.dist, 0));
   } else if (round.gameMode === "tp") {
     const ev = tpEvaluate(scenario, shipments);
     if (!ev.feasible) {
-      alert("Please fix feasibility issues before submitting:\n" + ev.violations.join("\n"));
+      alert("Please fix feasibility issues before submitting:\n" + (ev.violations || []).join("\n"));
       return;
     }
-    myCost = Math.round(ev.totalCost);
+    cost = Math.round(ev.totalCost);
   } else if (round.gameMode === "ts") {
-    const allowed = new Set((scenario?.arcs||[]).map(a => `${a.u}>${a.v}`));
     let enteredCost = 0;
-    for (const [k,q] of Object.entries(shipments||{})) {
+    const allowed = new Set((scenario?.arcs || []).map(a => `${a.u}>${a.v}`));
+    for (const [k, q] of Object.entries(shipments || {})) {
       if (!allowed.has(k)) continue;
-      const arc = scenario.arcs.find(a => `${a.u}>${a.v}` === k);
-      if (!arc) continue;
-      enteredCost += Number(q||0) * Number(arc.cost||0);
+      const arc = (scenario.arcs || []).find(a => `${a.u}>${a.v}` === k);
+      if (arc) enteredCost += Number(q || 0) * Number(arc.cost || 0);
     }
-    myCost = Math.round(enteredCost);
+    cost = Math.round(enteredCost);
   } else {
-    myCost = Math.round(legsPick.reduce((a,L)=>a+L.dist,0));
+    cost = Math.round(legsPick.reduce((a, L) => a + L.dist, 0));
   }
 
-  // // Optimal for scoring
-  // let optCostVal;
-  // if (round.gameMode === "tp")       optCostVal = tpOptimalCost(scenario).cost;
-  // else if (round.gameMode === "ts")  optCostVal = tsOptimalCost(scenario).cost;
-  // else if (round.gameMode === "sp")  optCostVal = spOptCost;
-  // else if (round.gameMode === "tsp") optCostVal = tspOptimalCost(scenario.nodes).cost;
-  // else if (round.gameMode === "vrp") optCostVal = vrpOptimalCost(scenario).cost;
-  // else                               optCostVal = pickOptimalCost(scenario).cost;
+  const answer = (round.gameMode === "tp" || round.gameMode === "ts")
+    ? { shipments }
+    : { path };
 
-  // const score = (Number.isFinite(optCostVal) && optCostVal > 0)
-  //   ? Math.max(0, Math.round(1000 * (optCostVal / Math.max(myCost, optCostVal)) ))
-  //   : 0;
+  await dbSaveSubmission(round.id, me.name, {
+    cost,
+    timeSec,
+    score: null,
+    path: answer
+  });
 
-  const r = { ...round, players: { ...(round.players||{}) } };
+  try { await dbComputeAndPersistOptimal(round); } catch {}
+
+  const next = { ...round, players: { ...(round.players || {}) } };
   if (round.gameMode === "tp" || round.gameMode === "ts") {
-    r.players[me.name] = {
-  cost: myCost,
-  timeSec,
-  path: round.gameMode === "sp" ? path : null,
-  shipments: round.gameMode === "tp" ? shipments : undefined,
-  flows: round.gameMode === "ts" ? shipments : undefined
-};
-
-
-    // r.players[me.name] = { cost: myCost, timeSec, score, shipments: { ...(shipments||{}) } };
+    next.players[me.name] = {
+      cost, timeSec, path: null,
+      shipments: answer.shipments,
+      submittedAt: new Date().toISOString()
+    };
   } else {
-    r.players[me.name] = { cost: myCost, timeSec, path: [...path] };
+    next.players[me.name] = {
+      cost, timeSec, path: [...path],
+      submittedAt: new Date().toISOString()
+    };
   }
-  await saveRoomRound(me.room, r);
-  // persist per-player row as well
-  // also persist a per-player row so Past Rounds can load players
-try {
-  const cur = await dbLoadCurrentRoundRow(me.room); // { id } of the open round
-  if (cur?.id) {
-    await dbUpsertSubmission(cur.id, me.name, {
-  cost: myCost,
-  time_sec: timeSec,
-  path: r.players?.[me.name]?.path || null
-});
 
-  }
-} catch (e) {
-  console.warn("submissions upsert failed", e);
+  setSubmitted(true);
+  onRoundUpdate(next);
 }
 
-// reflect UI state
-setSubmitted(true);
-
-
-  onRoundUpdate(r);
-}
 
 
 
@@ -4710,44 +4786,44 @@ async function dbListPastRounds(room, limit = 100) {   // ✅ default 100
 
 
 
-async function dbSaveRound(room, round) {
-  try {
-    if (!round) {
-  const nowIso = new Date().toISOString();
-  await supabase
-    .from("rounds")
-    .update({ is_open: false, ended_at: nowIso, reveal_board: false })
-    .eq("room", room)
-    .eq("is_open", true);
-  localStorage.removeItem("scma_supa_offline");
-  return null;
-}
+// async function dbSaveRound(room, round) {
+//   try {
+//     if (!round) {
+//   const nowIso = new Date().toISOString();
+//   await supabase
+//     .from("rounds")
+//     .update({ is_open: false, ended_at: nowIso, reveal_board: false })
+//     .eq("room", room)
+//     .eq("is_open", true);
+//   localStorage.removeItem("scma_supa_offline");
+//   return null;
+// }
 
-    const { data, error } = await supabase
-      .from("rounds")
-      .upsert({
-        id: round.id,                      // may be undefined on first save
-        room,
-        game_mode: round.gameMode,
-        payload: round,
-        started_at: new Date(round.startedAt).toISOString(),
-        ends_at: round.endsAt ? new Date(round.endsAt).toISOString() : null,
-        is_open: !!round.isOpen,
-        reveal_board: !!round.revealBoard,
-        scored: !!round.scored,
-      })
-      .select()
-      .single();                           // ⬅️ get the row back (with id)
-    if (error) throw error;
+//     const { data, error } = await supabase
+//       .from("rounds")
+//       .upsert({
+//         id: round.id,                      // may be undefined on first save
+//         room,
+//         game_mode: round.gameMode,
+//         payload: round,
+//         started_at: new Date(round.startedAt).toISOString(),
+//         ends_at: round.endsAt ? new Date(round.endsAt).toISOString() : null,
+//         is_open: !!round.isOpen,
+//         reveal_board: !!round.revealBoard,
+//         scored: !!round.scored,
+//       })
+//       .select()
+//       .single();                           // ⬅️ get the row back (with id)
+//     if (error) throw error;
 
-    localStorage.removeItem("scma_supa_offline");
-    return data;                           // return the row (id + payload + columns)
-  } catch (e) {
-    console.warn("Supabase write failed; using local-only cache.", e);
-    localStorage.setItem("scma_supa_offline", "1");
-    return null;
-  }
-}
+//     localStorage.removeItem("scma_supa_offline");
+//     return data;                           // return the row (id + payload + columns)
+//   } catch (e) {
+//     console.warn("Supabase write failed; using local-only cache.", e);
+//     localStorage.setItem("scma_supa_offline", "1");
+//     return null;
+//   }
+// }
 
 
 
@@ -4863,9 +4939,9 @@ async function dbLoadSeasonTotals(room) {
   return data || [];
 }
 
-async function dbResetSeason(room) {
-  await supabase.from("season_totals").delete().eq("room", room);
-}
+// async function dbResetSeason(room) {
+//   await supabase.from("season_totals").delete().eq("room", room);
+// }
 function LoginGate({ onLogin }) {
   const [room, setRoom] = useState("SCMA");
   const [username, setUsername] = useState("");
