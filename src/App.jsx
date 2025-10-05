@@ -3092,7 +3092,18 @@ async function openHistoryRound(row) {
                       <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
                         <div className="lg:col-span-2 rounded-lg overflow-hidden border border-emerald-300/20">
                         <MapGridFrame>
-                          <SvgMap scenario={scenario} round={payload} path={selPlayer?.path || []} optPath={best.path} readonly />
+                          <SvgMap
+  scenario={scenario}
+  round={payload}
+  path={
+    Array.isArray(selPlayer?.path?.path) ? selPlayer.path.path
+    : Array.isArray(selPlayer?.path) ? selPlayer.path
+    : []
+  }
+  optPath={best.path}
+  readonly
+/>
+
                         </MapGridFrame>
 
                         </div>
@@ -3126,7 +3137,10 @@ async function openHistoryRound(row) {
                           <ul className="space-y-1">
                             {subs.map(row => {
                               const name = row.username || row.user || row.name || "Player";
-                              const path = Array.isArray(row.path) ? row.path : null;
+                              const path = Array.isArray(row.path?.path) ? row.path.path
+                              : Array.isArray(row.path) ? row.path
+                              : null;
+
                               const cost = row.cost ?? (path ? costForPayloadPath(scenario, payload, path) : null);
                               // pull TP/TS quantities from the round payload
                               const pr = (payload?.players || {})[name] || {};
@@ -3134,9 +3148,9 @@ async function openHistoryRound(row) {
                               const tsFlow = pr.flows || null;      // {"Hub1>D1": q, ...}
 
                               return (
-                                <li key={row.id}>
+                                <li key={row.username}>
                                   <button
-                                    className={"w-full text-left px-2 py-1 rounded " + (selPlayer?.id === row.id ? "bg-emerald-800" : "hover:bg-emerald-900/50")}
+                                    className={"w-full text-left px-2 py-1 rounded " + (selPlayer?.username === row.username ? "bg-emerald-800" : "hover:bg-emerald-900/50")}
                                     onClick={() => setSelPlayer(row)}
                                   >
                                     <div className="flex items-center justify-between">
@@ -4770,7 +4784,8 @@ async function dbListPastRounds(room, limit = 100) {   // ✅ default 100
   try {
     const { data, error } = await supabase
       .from("rounds")
-      .select("id, room, payload, started_at, ended_at, created_at")
+      .select("id, room, payload, snapshotscenario, started_at, ended_at, created_at")
+
       .eq("room", room)
       .eq("is_open", false)                           // ✅ only CLOSED
       .order("started_at", { ascending: false })
@@ -4855,7 +4870,7 @@ async function dbListSubmissions(roundId) {
   try {
     const { data, error } = await supabase
       .from("submissions")
-      .select("id, round_id, username, score, cost, time_sec, path")
+      .select("round_id, username, score, cost, time_sec, path")
       .eq("round_id", roundId)
       .order("cost", { ascending: true });
     if (error) { console.error("dbListSubmissions error", error); return []; }
