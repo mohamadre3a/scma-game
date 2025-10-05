@@ -2758,8 +2758,12 @@ function SeasonLeaderboardCard({ room, season }) {
   const [playerHistory, setPlayerHistory] = React.useState([]);
   useEffect(() => {
     if (!selectedPlayer) return;
+    const username = typeof selectedPlayer === "string"
+      ? selectedPlayer
+      : (selectedPlayer.username || selectedPlayer.name || null);
+    if (!username) return;
     (async () => {
-      const rows = await dbListPlayerHistory(room, selectedPlayer, 100);
+      const rows = await dbListPlayerHistory(room, username, 100);
       setPlayerHistory(rows);
     })();
   }, [room, selectedPlayer]);
@@ -2775,16 +2779,29 @@ function SeasonLeaderboardCard({ room, season }) {
   const [selPlayer, setSelPlayer] = React.useState(null);// selected player row
 
   const [playerHist, setPlayerHist] = React.useState([]);
-useEffect(() => {
-  let alive = true;
-  (async () => {
-    if (!selPlayer || typeof dbListPlayerHistory !== "function") { setPlayerHist([]); return; }
-    const rows = await dbListPlayerHistory(room, selPlayer.username || selPlayer.name, 100);
-    if (!alive) return;
-    setPlayerHist(rows || []);
-  })();
-  return () => { alive = false; };
-}, [selPlayer, room]);
+  const [nameMap, setNameMap] = React.useState({});
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      if (!selPlayer || typeof dbListPlayerHistory !== "function") { setPlayerHist([]); return; }
+      const rows = await dbListPlayerHistory(room, selPlayer.username || selPlayer.name, 100);
+      if (!alive) return;
+      setPlayerHist(rows || []);
+    })();
+    return () => { alive = false; };
+  }, [selPlayer, room]);
+
+  useEffect(() => {
+    if (!histOpen) return;
+    let alive = true;
+    (async () => {
+      const map = await loadDisplayNameMap(room);
+      if (!alive) return;
+      setNameMap(map);
+    })();
+    return () => { alive = false; };
+  }, [histOpen, room]);
 
 
 
@@ -2916,7 +2933,36 @@ async function openHistoryRound(row) {
       score: r.score, cost: r.cost, time_sec: r.timeSec, path: r.path,
     }));
   }
-  setSubs(s || []);
+  const normalized = (s || []).map(entry => {
+    const normalizedPath = normalizeHistoryPath(entry.path);
+    const displayLabel = formatHistoryAnswer(entry.path);
+    let cost = entry.cost;
+    if (cost == null && entry.time_sec != null) cost = entry.time_sec;
+    if (cost == null && entry.timeSec != null) cost = entry.timeSec;
+    if (cost == null && normalizedPath) {
+      const computed = costForPayloadPath(scenario, payload, normalizedPath, modeHint);
+      if (Number.isFinite(computed)) cost = computed;
+    }
+    const numericCost = Number.isFinite(Number(cost)) ? Number(cost) : null;
+    return {
+      ...entry,
+      path: entry.path,
+      normalizedPath,
+      pathLabel: displayLabel,
+      finalCost: numericCost,
+    };
+  });
+
+  normalized.sort((a, b) => {
+    const ac = a.finalCost == null ? Infinity : a.finalCost;
+    const bc = b.finalCost == null ? Infinity : b.finalCost;
+    if (ac !== bc) return ac - bc;
+    const an = a.username || a.user || a.name || "";
+    const bn = b.username || b.user || b.name || "";
+    return an.localeCompare(bn);
+  });
+
+  setSubs(normalized);
 }
 
 
@@ -2955,7 +3001,7 @@ async function openHistoryRound(row) {
     <div key={e.name} className={`flex items-center justify-between rounded-xl px-3 py-2 ${i === 0 ? "bg-emerald-700/40" : i === 1 ? "bg-emerald-700/25" : i === 2 ? "bg-amber-700/30" : "bg-white/5"}`}>
       <div className="flex items-center gap-3">
         <Medal rank={i + 1} />
-        <button className="font-semibold hover:underline underline-offset-2" onClick={() => setSelectedPlayer({ username: e.username || e.name, displayName: roster?.[e.username || e.name]?.displayName || (e.displayName || e.name) })}>{e.name}</button>
+        <button className="font-semibold hover:underline underline-offset-2" onClick={() => setSelectedPlayer({ username: e.username || e.name, displayName: e.displayName || e.name })}>{e.name}</button>
       </div>
       <div className="text-right text-sm font-bold">{e.pts} pts</div>
     </div>
@@ -2968,7 +3014,7 @@ async function openHistoryRound(row) {
         {selectedPlayer && (
   <div className="mt-4 rounded-xl border border-emerald-300/20 p-3">
     <div className="flex items-center justify-between mb-2">
-      <div className="font-semibold">History — {selectedPlayer}</div>
+      <div className="font-semibold">History — {selectedPlayer.displayName || selectedPlayer.username || selectedPlayer}</div>
       <button className="text-xs bg-emerald-700 hover:bg-emerald-600 rounded px-2 py-1"
               onClick={() => setSelectedPlayer(null)}>Close</button>
     </div>
@@ -2979,11 +3025,15 @@ async function openHistoryRound(row) {
           <div className="flex items-center justify-between">
             <div>
               <div className="text-xs opacity-80 font-mono">{new Date(h.startedAt).toLocaleString()}</div>
-              {h.path && (
-  <div className="text-[11px] opacity-75 font-mono">
-    path: [{formatPathLabels(scenarioFromPayload(h.payload), h.path, " → ")}]
-  </div>
-)}
+              {Array.isArray(h.path) && h.path.length ? (
+                <div className="text-[11px] opacity-75 font-mono">
+                  path: [{formatPathLabels(scenarioFromPayload(h.payload), h.path, " → ")}]
+                </div>
+              ) : h.pathLabel ? (
+                <div className="text-[11px] opacity-75 font-mono">
+                  solution: {h.pathLabel}
+                </div>
+              ) : null}
 {(() => {
   const mode = h?.payload?.gameMode;
   const scn = scenarioFromPayload(h.payload);
@@ -3071,6 +3121,8 @@ async function openHistoryRound(row) {
 
 
                   
+                  const roundMode = payload?.gameMode || payload?.mode || sel?.gameMode || sel?.game_mode;
+
                   const objLabel = payload?.objectiveMode === "dual"
                   ? `${Math.round(100 * (payload?.alpha ?? 0.5))}% ${payload?.objA} + ${Math.round(100 * (1 - (payload?.alpha ?? 0.5)))}% ${payload?.objB}`
                   : (payload?.objA || "time");
@@ -3094,58 +3146,121 @@ async function openHistoryRound(row) {
                         <MapGridFrame>
                           <SvgMap scenario={scenario} round={payload} path={selPlayer?.path || []} optPath={best.path} readonly />
                         </MapGridFrame>
+                        {((roundMode === "tsp" || roundMode === "vrp") && Array.isArray(scenario?.nodes)) && (
+                          <div className="bg-black/40 border-t border-emerald-300/20">
+                            <div className="px-3 py-2 font-semibold text-sm border-b border-emerald-300/20">Node Coordinates</div>
+                            <table className="w-full text-xs md:text-sm">
+                              <thead>
+                                <tr className="text-left">
+                                  <th className="px-3 py-1">#</th>
+                                  <th className="px-3 py-1">Node</th>
+                                  <th className="px-3 py-1">Coordinates (x, y)</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {scenario.nodes.map((node, idx) => {
+                                  const formatCoord = (v) => {
+                                    const num = Number(v);
+                                    if (Number.isFinite(num)) {
+                                      const rounded = Math.round(num * 100) / 100;
+                                      return String(rounded).replace(/\.0+$/, "");
+                                    }
+                                    return v ?? "—";
+                                  };
+                                  return (
+                                    <tr key={node.id || idx} className="border-t border-emerald-300/10">
+                                      <td className="px-3 py-1 font-mono whitespace-nowrap">{idx + 1}</td>
+                                      <td className="px-3 py-1 whitespace-nowrap">{node.label || node.id || `Node ${idx + 1}`}</td>
+                                      <td className="px-3 py-1 font-mono">({formatCoord(node.x)}, {formatCoord(node.y)})</td>
+                                    </tr>
+                                  );
+                                })}
+                              </tbody>
+                            </table>
+                          </div>
+                        )}
 
                         </div>
                         <div className="rounded-lg border border-emerald-300/20 p[2px] p-2">
                           <div className="font-semibold mb-2">Players</div>
                           {selPlayer && (
                             <div className="mt-3 rounded-lg border border-emerald-300/20 p-2">
-                              <div className="font-semibold mb-2">History for {selPlayer.username || selPlayer.name}</div>
+                              <div className="font-semibold mb-2">History for {nameMap[selPlayer.username] || selPlayer.displayName || selPlayer.username || selPlayer.name}</div>
                               <ul className="text-xs space-y-1 max-h-48 overflow-auto">
-                                {playerHist.map(h => (
-                                  <li key={`${h.round_id}-${h.started_at}`} className="flex items-center justify-between">
-                                    <span className="font-mono">
-                                      {new Date(h.started_at).toLocaleDateString()} • R{h.round_id}
-                                    </span>
-                                    <span className="font-mono">
-                                      {h.cost != null ? Number(h.cost).toFixed(2) : "—"} • {Math.round(h.score ?? 0)}
-                                    </span>
-                                  </li>
-                                ))}
-                                {!playerHist.length && <li className="opacity-70">No past submissions.</li>}
-                              </ul>
-                              {playerHist[0]?.path && (
-                                <div className="text-[11px] opacity-75 font-mono mt-2">
-                                  last path: [{formatPathLabels(scenarioFromPayload(playerHist[0].payload), playerHist[0].path, " → ")}]
+                              {playerHist.map(h => (
+                                <li key={`${h.round_id}-${h.started_at}`} className="flex items-center justify-between">
+                                  <span className="font-mono">
+                                    {new Date(h.started_at).toLocaleDateString()} • R{h.round_id}
+                                  </span>
+                                  <span className="font-mono">
+                                    {h.cost != null ? Number(h.cost).toFixed(2) : "—"} • {Math.round(h.score ?? 0)}
+                                  </span>
+                                </li>
+                              ))}
+                              {!playerHist.length && <li className="opacity-70">No past submissions.</li>}
+                            </ul>
+                              {(() => {
+                                const first = playerHist[0];
+                                if (!first) return null;
+                                if (Array.isArray(first.path) && first.path.length) {
+                                  return (
+                                    <div className="text-[11px] opacity-75 font-mono mt-2">
+                                      last path: [{formatPathLabels(scenarioFromPayload(first.payload), first.path, " → ")}]
 
-                                </div>
-                              )}
+                                    </div>
+                                  );
+                                }
+                                if (first.pathLabel) {
+                                  return (
+                                    <div className="text-[11px] opacity-75 font-mono mt-2">
+                                      last solution: {first.pathLabel}
+                                    </div>
+                                  );
+                                }
+                                return null;
+                              })()}
                             </div>
                           )}
 
                           <ul className="space-y-1">
                             {subs.map(row => {
-                              const name = row.username || row.user || row.name || "Player";
-                              const path = Array.isArray(row.path) ? row.path : null;
-                              const cost = row.cost ?? (path ? costForPayloadPath(scenario, payload, path) : null);
+                              const username = row.username || row.user || row.name || row.id || "Player";
+                              const displayName = nameMap[username] || row.display_name || row.name || row.username || username || "Player";
+                              const path = Array.isArray(row.normalizedPath) ? row.normalizedPath : normalizeHistoryPath(row.path);
+                              const rawCost = row.cost;
+                              const costFromRow = (typeof rawCost === "string" && rawCost.trim() === "") ? null : rawCost;
+                              let finalCost = row.finalCost != null ? row.finalCost : (costFromRow != null && Number.isFinite(Number(costFromRow)) ? Number(costFromRow) : null);
+                              if (finalCost == null && path && scenario) {
+                                const computed = costForPayloadPath(scenario, payload, path, roundMode);
+                                if (Number.isFinite(computed)) finalCost = computed;
+                              }
+                              const rowKey = row.id ?? username;
+                              const selKey = selPlayer ? (selPlayer.id ?? selPlayer.username ?? selPlayer.name ?? selPlayer.user) : null;
+                              const isSelected = selKey === rowKey;
                               // pull TP/TS quantities from the round payload
-                              const pr = (payload?.players || {})[name] || {};
+                              const pr = (payload?.players || {})[username] || {};
                               const tpShip = pr.shipments || null;  // {"S1>D1": q, ...}
                               const tsFlow = pr.flows || null;      // {"Hub1>D1": q, ...}
 
+                              const pathText = Array.isArray(path) && path.length
+                                ? `path: [${path.join(" → ")}]`
+                                : row.pathLabel
+                                  ? `solution: ${row.pathLabel}`
+                                  : null;
+
                               return (
-                                <li key={row.id}>
+                                <li key={rowKey}>
                                   <button
-                                    className={"w-full text-left px-2 py-1 rounded " + (selPlayer?.id === row.id ? "bg-emerald-800" : "hover:bg-emerald-900/50")}
-                                    onClick={() => setSelPlayer(row)}
+                                    className={"w-full text-left px-2 py-1 rounded " + (isSelected ? "bg-emerald-800" : "hover:bg-emerald-900/50")}
+                                    onClick={() => setSelPlayer({ ...row, id: rowKey, username, displayName, path: Array.isArray(path) ? path : [], finalCost, pathLabel: row.pathLabel })}
                                   >
                                     <div className="flex items-center justify-between">
-                                      <span>{name}</span>
-                                      <span className="font-mono">{cost != null ? Number(cost).toFixed(2) : "—"}</span>
+                                      <span>{displayName}</span>
+                                      <span className="font-mono">{finalCost != null ? Number(finalCost).toFixed(2) : "—"}</span>
                                     </div>
-                                    {path && (
+                                    {pathText && (
                                       <div className="text-[11px] opacity-75 font-mono overflow-hidden text-ellipsis">
-                                        path: [{path.join(" → ")}]
+                                        {pathText}
                                       </div>
                                     )}
                                     {tpShip && (
@@ -4851,6 +4966,64 @@ async function dbUpsertSubmission(roundId, username, rec) {
 
 
 
+function normalizeHistoryPath(value) {
+  if (value == null) return null;
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    try {
+      return normalizeHistoryPath(JSON.parse(trimmed));
+    } catch {
+      return null;
+    }
+  }
+  if (typeof value === "object") {
+    if (Array.isArray(value.path)) return value.path;
+    if (Array.isArray(value.paths)) return value.paths;
+    if (Array.isArray(value.route)) return value.route;
+    if (Array.isArray(value.routes)) {
+      const allArrays = value.routes.every((r) => Array.isArray(r));
+      return allArrays ? value.routes.flat() : value.routes;
+    }
+    if (value.path != null) return normalizeHistoryPath(value.path);
+    if (value.answer != null) return normalizeHistoryPath(value.answer);
+    if (value.data != null) return normalizeHistoryPath(value.data);
+  }
+  return null;
+}
+
+function formatHistoryAnswer(value) {
+  if (value == null) return null;
+  if (Array.isArray(value)) return null;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    try {
+      return formatHistoryAnswer(JSON.parse(trimmed));
+    } catch {
+      return trimmed;
+    }
+  }
+  if (typeof value === "object") {
+    if (Array.isArray(value.path) || Array.isArray(value.paths) || Array.isArray(value.route) || Array.isArray(value.routes)) {
+      const arr = normalizeHistoryPath(value);
+      return Array.isArray(arr) && arr.length ? arr.join(" → ") : null;
+    }
+    const shipments = value.shipments || value.flows;
+    if (shipments && typeof shipments === "object") {
+      const entries = Object.entries(shipments).filter(([, q]) => Number(q) > 0);
+      return entries.length ? entries.map(([k, q]) => `${k}:${q}`).join(", ") : "—";
+    }
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value);
+}
+
 async function dbListSubmissions(roundId) {
   try {
     const { data, error } = await supabase
@@ -4887,20 +5060,24 @@ async function dbListPlayerHistory(room, username, limit = 50) {
 
     if (error) { throw error; }
     return (data || []).map(r => {
-    const payload = r.rounds.payload || {};
-    const usernameKey = username; // the function arg
-    const perPlayer = (payload.players || {})[usernameKey] || {};
-    return {
-      roundId: r.round_id,
-      startedAt: r.rounds.started_at,
-      payload,
-      cost: r.cost,
-      timeSec: r.time_sec,
-      path: r.path,
-      shipments: perPlayer.shipments || null, // TP solutions
-      flows: perPlayer.flows || null,         // TS solutions
-    };
-});
+      const payload = r.rounds.payload || {};
+      const usernameKey = username; // the function arg
+      const perPlayer = (payload.players || {})[usernameKey] || {};
+      const normalizedPath = normalizeHistoryPath(r.path);
+      return {
+        roundId: r.round_id,
+        round_id: r.round_id,
+        startedAt: r.rounds.started_at,
+        started_at: r.rounds.started_at,
+        payload,
+        cost: r.cost,
+        timeSec: r.time_sec,
+        path: normalizedPath,
+        pathLabel: formatHistoryAnswer(r.path),
+        shipments: perPlayer.shipments || null, // TP solutions
+        flows: perPlayer.flows || null,         // TS solutions
+      };
+    });
 
   } catch (e) {
     console.error("dbListPlayerHistory error", e);
