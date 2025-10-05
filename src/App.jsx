@@ -2738,7 +2738,18 @@ function SeasonLeaderboardCard({ room, season }) {
   // season totals (existing)
     const [boardTab, setBoardTab] = useState("season"); // "season" | "day"
   const [dayTotals, setDayTotals] = useState([]);
+  const [nameMap, setNameMap] = useState({});
   const todayKey = todayKeyMDT();
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const map = await loadDisplayNameMap(room);
+      if (!alive) return;
+      setNameMap(map || {});
+    })();
+    return () => { alive = false; };
+  }, [room]);
 
   useEffect(() => {
   if (boardTab !== "day") return;
@@ -3064,18 +3075,55 @@ async function openHistoryRound(row) {
                 {(() => {
                   const payload = sel?.payload || {};
                   const scenario = scenarioFromPayload(payload);
+                  const modeHint = sel?.game_mode || sel?.gameMode || payload?.gameMode;
                   const isTpTs = (payload?.gameMode === "tp" || payload?.gameMode === "ts");
-                    if (!isTpTs && !scenario?.nodes?.length) {
-                      return <div className="opacity-70">Scenario unavailable.</div>;
-                    }
-
-
-                  
-                  const objLabel = payload?.objectiveMode === "dual"
-                  ? `${Math.round(100 * (payload?.alpha ?? 0.5))}% ${payload?.objA} + ${Math.round(100 * (1 - (payload?.alpha ?? 0.5)))}% ${payload?.objB}`
-                  : (payload?.objA || "time");
+                  if (!isTpTs && !scenario?.nodes?.length) {
+                    return <div className="opacity-70">Scenario unavailable.</div>;
+                  }
 
                   const optimalScore = Number.isFinite(best.cost) ? best.cost.toFixed(2) : "—";
+
+                  const decorateCost = (row, path) => {
+                    if (row.cost != null) {
+                      const n = Number(row.cost);
+                      return Number.isFinite(n) ? n : null;
+                    }
+                    if (!path) return null;
+                    const computed = costForPayloadPath(scenario, payload, path, modeHint);
+                    const n = Number(computed);
+                    return Number.isFinite(n) ? n : null;
+                  };
+
+                  const decoratedSubs = subs.map(row => {
+                    const username = row.username || row.user || row.name || row.id || "";
+                    const path = Array.isArray(row.path?.path) ? row.path.path
+                      : Array.isArray(row.path) ? row.path
+                      : null;
+                    const cost = decorateCost(row, path);
+                    const displayName = nameMap[username] || row.display_name || row.displayName || row.name || username || "Player";
+                    return {
+                      ...row,
+                      username,
+                      displayName,
+                      resolvedPath: path,
+                      computedCost: cost,
+                    };
+                  }).sort((a, b) => {
+                    const ac = a.computedCost;
+                    const bc = b.computedCost;
+                    if (ac == null && bc == null) return (a.displayName || "").localeCompare(b.displayName || "");
+                    if (ac == null) return 1;
+                    if (bc == null) return -1;
+                    return ac - bc;
+                  });
+
+                  const showNodeTable = (modeHint === "tsp" || modeHint === "vrp") && Array.isArray(scenario?.nodes) && scenario.nodes.length > 0;
+                  const formatCoord = (v) => {
+                    if (typeof v === "number") return Number.isInteger(v) ? v.toString() : v.toFixed(1);
+                    const n = Number(v);
+                    if (Number.isFinite(n)) return Number.isInteger(n) ? n.toString() : n.toFixed(1);
+                    return String(v ?? "—");
+                  };
 
                   return (
                     <div>
@@ -3086,8 +3134,27 @@ async function openHistoryRound(row) {
                         <div className="text-sm mt-1">
                           Optimal: <span className="font-mono">{optimalScore}</span>
                         </div>
-
                       </div>
+
+                      {showNodeTable && (
+                        <div className="mb-3 rounded-lg border border-emerald-300/20 p-2">
+                          <div className="font-semibold text-sm mb-1">Node Coordinates</div>
+                          <table className="w-full text-xs text-emerald-100/90">
+                            <tbody>
+                              {scenario.nodes.map(node => (
+                                <tr key={node.id} className="border-t border-emerald-300/10 first:border-t-0">
+                                  <td className="py-1 pr-3 font-mono whitespace-nowrap">
+                                    {node.id}{node.label ? ` — ${node.label}` : ""}
+                                  </td>
+                                  <td className="py-1 font-mono text-right whitespace-nowrap">
+                                    ({formatCoord(node.x)}, {formatCoord(node.y)})
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
 
                       <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
                         <div className="lg:col-span-2 rounded-lg overflow-hidden border border-emerald-300/20">
@@ -3111,7 +3178,7 @@ async function openHistoryRound(row) {
                           <div className="font-semibold mb-2">Players</div>
                           {selPlayer && (
                             <div className="mt-3 rounded-lg border border-emerald-300/20 p-2">
-                              <div className="font-semibold mb-2">History for {selPlayer.username || selPlayer.name}</div>
+                              <div className="font-semibold mb-2">History for {selPlayer.displayName || selPlayer.username || selPlayer.name}</div>
                               <ul className="text-xs space-y-1 max-h-48 overflow-auto">
                                 {playerHist.map(h => (
                                   <li key={`${h.round_id}-${h.started_at}`} className="flex items-center justify-between">
@@ -3135,26 +3202,22 @@ async function openHistoryRound(row) {
                           )}
 
                           <ul className="space-y-1">
-                            {subs.map(row => {
-                              const name = row.username || row.user || row.name || "Player";
-                              const path = Array.isArray(row.path?.path) ? row.path.path
-                              : Array.isArray(row.path) ? row.path
-                              : null;
-
-                              const cost = row.cost ?? (path ? costForPayloadPath(scenario, payload, path) : null);
-                              // pull TP/TS quantities from the round payload
-                              const pr = (payload?.players || {})[name] || {};
-                              const tpShip = pr.shipments || null;  // {"S1>D1": q, ...}
-                              const tsFlow = pr.flows || null;      // {"Hub1>D1": q, ...}
+                            {decoratedSubs.map(row => {
+                              const path = row.resolvedPath;
+                              const cost = row.computedCost;
+                              const playersObj = payload?.players || {};
+                              const pr = playersObj[row.username] || playersObj[row.user] || playersObj[row.name] || playersObj[row.displayName] || {};
+                              const tpShip = pr.shipments || null;
+                              const tsFlow = pr.flows || null;
 
                               return (
-                                <li key={row.username}>
+                                <li key={row.username || row.id || row.displayName}>
                                   <button
                                     className={"w-full text-left px-2 py-1 rounded " + (selPlayer?.username === row.username ? "bg-emerald-800" : "hover:bg-emerald-900/50")}
                                     onClick={() => setSelPlayer(row)}
                                   >
                                     <div className="flex items-center justify-between">
-                                      <span>{name}</span>
+                                      <span>{row.displayName}</span>
                                       <span className="font-mono">{cost != null ? Number(cost).toFixed(2) : "—"}</span>
                                     </div>
                                     {path && (
@@ -3171,7 +3234,6 @@ async function openHistoryRound(row) {
                                       </div>
                                     )}
                                     {tsFlow && !tpShip && (
-
                                       <div className="text-[11px] opacity-75 font-mono overflow-hidden text-ellipsis">
                                         {Object.entries(tsFlow)
                                           .filter(([_, q]) => Number(q) > 0)
@@ -3184,7 +3246,7 @@ async function openHistoryRound(row) {
                                 </li>
                               );
                             })}
-                            {!subs.length && <li className="opacity-70">No submissions saved.</li>}
+                            {!decoratedSubs.length && <li className="opacity-70">No submissions saved.</li>}
                           </ul>
                         </div>
                       </div>
