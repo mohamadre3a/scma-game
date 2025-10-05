@@ -2774,6 +2774,17 @@ function SeasonLeaderboardCard({ room, season }) {
   const [best, setBest] = React.useState({ path: [], cost: Infinity }); // optimal for selected
   const [selPlayer, setSelPlayer] = React.useState(null);// selected player row
 
+  const [nameMap, setNameMap] = React.useState({});
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const map = await loadDisplayNameMap(room);
+      if (!alive) return;
+      setNameMap(map || {});
+    })();
+    return () => { alive = false; };
+  }, [room]);
+
   const [playerHist, setPlayerHist] = React.useState([]);
 useEffect(() => {
   let alive = true;
@@ -2894,30 +2905,57 @@ function costForPayloadPath(scenario, payload, playerPath, modeHint) {
   
 
 
-async function openHistoryRound(row) {
-  setSelPlayer(null);
-  setSel(row);
+  const openHistoryRound = React.useCallback(async (row) => {
+    setSelPlayer(null);
+    setSel(row);
 
-  const payload = row?.payload || {};
-  const scenario = scenarioFromPayload(payload);
-  const modeHint = row?.game_mode || row?.gameMode || payload?.gameMode;
+    const payload = row?.payload || {};
+    const scenario = scenarioFromPayload(payload);
+    const modeHint = row?.game_mode || row?.gameMode || payload?.gameMode;
 
-  setBest(computeOptimalForPayload(scenario, payload, modeHint));
+    setBest(computeOptimalForPayload(scenario, payload, modeHint));
 
-  let s = [];
-  if (typeof dbListSubmissions === "function") {
-    try { s = await dbListSubmissions(row.id); } catch {}
-  }
-  if (!s || !s.length) {
-    // fall back to what we saved inside payload at close/reveal time
-    const playersObj = payload.players || row?.players || {};
-    s = Object.entries(playersObj).map(([username, r]) => ({
-      id: username, username,
-      score: r.score, cost: r.cost, time_sec: r.timeSec, path: r.path,
-    }));
-  }
-  setSubs(s || []);
-}
+    let s = [];
+    if (typeof dbListSubmissions === "function") {
+      try { s = await dbListSubmissions(row.id); } catch {}
+    }
+    if (!s || !s.length) {
+      // fall back to what we saved inside payload at close/reveal time
+      const playersObj = payload.players || row?.players || {};
+      s = Object.entries(playersObj).map(([username, r]) => ({
+        id: username, username,
+        score: r.score, cost: r.cost, time_sec: r.timeSec, path: r.path,
+      }));
+    }
+    const normalized = (s || []).map((rec) => {
+      const username = rec.username || rec.user || rec.name || rec.id || "";
+      const path = Array.isArray(rec.path?.path) ? rec.path.path
+        : Array.isArray(rec.path) ? rec.path
+        : null;
+      const computedCost = rec.cost ?? (path ? costForPayloadPath(scenario, payload, path, modeHint) : null);
+      const timeSec = rec.time_sec ?? rec.timeSec ?? rec.time ?? null;
+      const displayName = nameMap[username] || rec.display_name || rec.displayName || username || "Player";
+      return {
+        ...rec,
+        username,
+        displayName,
+        computedCost,
+        computedTime: timeSec,
+      };
+    });
+
+    normalized.sort((a, b) => {
+      const ac = Number.isFinite(Number(a.computedCost)) ? Number(a.computedCost) : Infinity;
+      const bc = Number.isFinite(Number(b.computedCost)) ? Number(b.computedCost) : Infinity;
+      if (ac !== bc) return ac - bc;
+      const at = Number.isFinite(Number(a.computedTime)) ? Number(a.computedTime) : Infinity;
+      const bt = Number.isFinite(Number(b.computedTime)) ? Number(b.computedTime) : Infinity;
+      if (at !== bt) return at - bt;
+      return (a.displayName || a.username || "").localeCompare(b.displayName || b.username || "");
+    });
+
+    setSubs(normalized);
+  }, [nameMap, room]);
 
 
   return (
@@ -3076,18 +3114,44 @@ async function openHistoryRound(row) {
                   : (payload?.objA || "time");
 
                   const optimalScore = Number.isFinite(best.cost) ? best.cost.toFixed(2) : "—";
+                  const scenarioNodes = Array.isArray(scenario?.nodes) ? scenario.nodes : [];
+                  const roundMode = payload?.gameMode || payload?.mode || sel?.game_mode || sel?.gameMode;
+                  const showNodeTable = (roundMode === "tsp" || roundMode === "vrp") && scenarioNodes.length > 0;
 
                   return (
                     <div>
                       <div className="mb-2">
                         <div className="font-semibold">Round {sel.id}</div>
                         <div className="text-xs opacity-80">{new Date(sel.started_at || sel.created_at).toLocaleString()}</div>
-                        <div className="text-xs mt-1">Game mode: <span className="font-mono">{payload?.gameMode || "sp"}</span></div>
+                        <div className="text-xs mt-1">Game mode: <span className="font-mono">{roundMode || "sp"}</span></div>
                         <div className="text-sm mt-1">
                           Optimal: <span className="font-mono">{optimalScore}</span>
                         </div>
 
                       </div>
+
+                      {showNodeTable && (
+                        <div className="mt-3 overflow-x-auto rounded-lg border border-emerald-300/20">
+                          <table className="min-w-full text-left text-xs font-mono text-emerald-100/90">
+                            <thead className="bg-emerald-900/40 text-[11px] uppercase tracking-wide text-emerald-200/70">
+                              <tr>
+                                <th className="px-3 py-2">Node</th>
+                                <th className="px-3 py-2">X</th>
+                                <th className="px-3 py-2">Y</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {scenarioNodes.map((node) => (
+                                <tr key={node.id} className="odd:bg-emerald-900/20">
+                                  <td className="px-3 py-1.5">{node.label ? `${node.id} — ${node.label}` : node.id}</td>
+                                  <td className="px-3 py-1.5">{node.x ?? "—"}</td>
+                                  <td className="px-3 py-1.5">{node.y ?? "—"}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
 
                       <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
                         <div className="lg:col-span-2 rounded-lg overflow-hidden border border-emerald-300/20">
@@ -3111,7 +3175,7 @@ async function openHistoryRound(row) {
                           <div className="font-semibold mb-2">Players</div>
                           {selPlayer && (
                             <div className="mt-3 rounded-lg border border-emerald-300/20 p-2">
-                              <div className="font-semibold mb-2">History for {selPlayer.username || selPlayer.name}</div>
+                              <div className="font-semibold mb-2">History for {selPlayer.displayName || selPlayer.username || selPlayer.name}</div>
                               <ul className="text-xs space-y-1 max-h-48 overflow-auto">
                                 {playerHist.map(h => (
                                   <li key={`${h.round_id}-${h.started_at}`} className="flex items-center justify-between">
@@ -3136,14 +3200,15 @@ async function openHistoryRound(row) {
 
                           <ul className="space-y-1">
                             {subs.map(row => {
-                              const name = row.username || row.user || row.name || "Player";
+                              const username = row.username || row.user || row.name || row.id || "Player";
+                              const displayName = row.displayName || row.display_name || nameMap[username] || username;
                               const path = Array.isArray(row.path?.path) ? row.path.path
                               : Array.isArray(row.path) ? row.path
                               : null;
 
-                              const cost = row.cost ?? (path ? costForPayloadPath(scenario, payload, path) : null);
+                              const cost = row.computedCost ?? row.cost ?? (path ? costForPayloadPath(scenario, payload, path) : null);
                               // pull TP/TS quantities from the round payload
-                              const pr = (payload?.players || {})[name] || {};
+                              const pr = (payload?.players || {})[username] || {};
                               const tpShip = pr.shipments || null;  // {"S1>D1": q, ...}
                               const tsFlow = pr.flows || null;      // {"Hub1>D1": q, ...}
 
@@ -3154,7 +3219,7 @@ async function openHistoryRound(row) {
                                     onClick={() => setSelPlayer(row)}
                                   >
                                     <div className="flex items-center justify-between">
-                                      <span>{name}</span>
+                                      <span>{displayName}</span>
                                       <span className="font-mono">{cost != null ? Number(cost).toFixed(2) : "—"}</span>
                                     </div>
                                     {path && (
