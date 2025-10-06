@@ -2879,13 +2879,20 @@ function scenarioFromPayload(payload) {
 
 
 // Compute an "optimal" for a past round (all modes) with safety
+function normalizeMode(mode, fallback = "sp") {
+  if (typeof mode === "string" && mode.trim()) return mode.trim().toLowerCase();
+  return fallback;
+}
+
 function computeOptimalForPayload(scenario, payload, modeHint) {
   if (!scenario) return { path: [], cost: Infinity };
 
-  const mode = (modeHint
-    || payload?.gameMode
-    || payload?.mode
-    || "sp");
+  const mode = normalizeMode(
+    modeHint
+      || payload?.gameMode
+      || payload?.mode,
+    "sp"
+  );
 
   if (mode === "sp") {
     if (!scenario?.nodes?.length) return { path: [], cost: Infinity };
@@ -2914,10 +2921,12 @@ function computeOptimalForPayload(scenario, payload, modeHint) {
 function costForPayloadPath(scenario, payload, playerPath, modeHint) {
   if (!Array.isArray(playerPath) || playerPath.length < 2) return null;
 
-  const mode = (modeHint
-    || payload?.gameMode
-    || payload?.mode
-    || "sp");
+  const mode = normalizeMode(
+    modeHint
+      || payload?.gameMode
+      || payload?.mode,
+    "sp"
+  );
 
   if (mode === "sp") {
     const edges = buildGraphEdges(scenario, payload);
