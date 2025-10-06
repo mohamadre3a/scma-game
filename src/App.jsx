@@ -2773,6 +2773,7 @@ function SeasonLeaderboardCard({ room, season }) {
   const [subs, setSubs] = React.useState([]);            // submissions for selected round
   const [best, setBest] = React.useState({ path: [], cost: Infinity }); // optimal for selected
   const [selPlayer, setSelPlayer] = React.useState(null);// selected player row
+  const [nameMap, setNameMap] = React.useState({});      // username -> display name
 
   const [playerHist, setPlayerHist] = React.useState([]);
 useEffect(() => {
@@ -2785,6 +2786,16 @@ useEffect(() => {
   })();
   return () => { alive = false; };
 }, [selPlayer, room]);
+
+  React.useEffect(() => {
+    let alive = true;
+    (async () => {
+      const map = await loadDisplayNameMap(room);
+      if (!alive) return;
+      setNameMap(map || {});
+    })();
+    return () => { alive = false; };
+  }, [room]);
 
 
 
@@ -2902,7 +2913,18 @@ async function openHistoryRound(row) {
   const scenario = scenarioFromPayload(payload);
   const modeHint = row?.game_mode || row?.gameMode || payload?.gameMode;
 
-  setBest(computeOptimalForPayload(scenario, payload, modeHint));
+  const computedOpt = computeOptimalForPayload(scenario, payload, modeHint);
+  const savedOpt = payload?.optimal || {};
+  const bestPath = Array.isArray(savedOpt.path) && savedOpt.path.length > 1
+    ? savedOpt.path
+    : (Array.isArray(computedOpt.path) ? computedOpt.path : []);
+  const bestCost = Number.isFinite(savedOpt.cost)
+    ? Number(savedOpt.cost)
+    : (Number.isFinite(computedOpt.cost) ? Number(computedOpt.cost) : null);
+  setBest({
+    path: Array.isArray(bestPath) ? bestPath : [],
+    cost: Number.isFinite(bestCost) ? bestCost : null,
+  });
 
   let s = [];
   if (typeof dbListSubmissions === "function") {
@@ -2916,7 +2938,44 @@ async function openHistoryRound(row) {
       score: r.score, cost: r.cost, time_sec: r.timeSec, path: r.path,
     }));
   }
-  setSubs(s || []);
+
+  const entries = (s || []).map(sub => {
+    const username = sub.username || sub.user || sub.name || "";
+    const resolvedPath = Array.isArray(sub.path?.path) ? sub.path.path
+      : Array.isArray(sub.path) ? sub.path
+      : [];
+    const baseCost = sub.cost != null ? Number(sub.cost)
+      : ((resolvedPath.length > 1 && scenario)
+          ? costForPayloadPath(scenario, payload, resolvedPath, modeHint)
+          : null);
+    const resolvedCost = Number.isFinite(baseCost) ? Number(baseCost) : null;
+    const rawTime = sub.time_sec ?? sub.timeSec;
+    const resolvedTime = Number.isFinite(Number(rawTime)) ? Number(rawTime) : null;
+
+    return {
+      ...sub,
+      username,
+      resolvedPath,
+      resolvedCost,
+      resolvedTime,
+    };
+  });
+
+  entries.sort((a, b) => {
+    const ac = a.resolvedCost;
+    const bc = b.resolvedCost;
+    if (ac == null && bc == null) return 0;
+    if (ac == null) return 1;
+    if (bc == null) return -1;
+    if (ac !== bc) return ac - bc;
+
+    const at = a.resolvedTime != null ? a.resolvedTime : Infinity;
+    const bt = b.resolvedTime != null ? b.resolvedTime : Infinity;
+    if (at !== bt) return at - bt;
+    return (a.username || "").localeCompare(b.username || "");
+  });
+
+  setSubs(entries);
 }
 
 
@@ -3064,6 +3123,7 @@ async function openHistoryRound(row) {
                 {(() => {
                   const payload = sel?.payload || {};
                   const scenario = scenarioFromPayload(payload);
+                  const modeHint = payload?.gameMode || payload?.mode || sel?.game_mode;
                   const isTpTs = (payload?.gameMode === "tp" || payload?.gameMode === "ts");
                     if (!isTpTs && !scenario?.nodes?.length) {
                       return <div className="opacity-70">Scenario unavailable.</div>;
@@ -3096,7 +3156,8 @@ async function openHistoryRound(row) {
   scenario={scenario}
   round={payload}
   path={
-    Array.isArray(selPlayer?.path?.path) ? selPlayer.path.path
+    Array.isArray(selPlayer?.resolvedPath) ? selPlayer.resolvedPath
+    : Array.isArray(selPlayer?.path?.path) ? selPlayer.path.path
     : Array.isArray(selPlayer?.path) ? selPlayer.path
     : []
   }
@@ -3111,7 +3172,7 @@ async function openHistoryRound(row) {
                           <div className="font-semibold mb-2">Players</div>
                           {selPlayer && (
                             <div className="mt-3 rounded-lg border border-emerald-300/20 p-2">
-                              <div className="font-semibold mb-2">History for {selPlayer.username || selPlayer.name}</div>
+                              <div className="font-semibold mb-2">History for {selPlayer.displayName || nameMap[selPlayer.username] || selPlayer.username || selPlayer.name}</div>
                               <ul className="text-xs space-y-1 max-h-48 overflow-auto">
                                 {playerHist.map(h => (
                                   <li key={`${h.round_id}-${h.started_at}`} className="flex items-center justify-between">
@@ -3136,30 +3197,34 @@ async function openHistoryRound(row) {
 
                           <ul className="space-y-1">
                             {subs.map(row => {
-                              const name = row.username || row.user || row.name || "Player";
-                              const path = Array.isArray(row.path?.path) ? row.path.path
-                              : Array.isArray(row.path) ? row.path
-                              : null;
-
-                              const cost = row.cost ?? (path ? costForPayloadPath(scenario, payload, path) : null);
+                              const username = row.username || row.user || row.name || "";
+                              const displayName = nameMap[username] || row.display_name || row.name || username || "Player";
+                              const resolvedPath = Array.isArray(row.resolvedPath)
+                                ? row.resolvedPath
+                                : Array.isArray(row.path?.path) ? row.path.path
+                                : Array.isArray(row.path) ? row.path
+                                : null;
+                              const cost = row.resolvedCost ?? ((resolvedPath && resolvedPath.length > 1 && scenario)
+                                ? costForPayloadPath(scenario, payload, resolvedPath, modeHint)
+                                : null);
                               // pull TP/TS quantities from the round payload
-                              const pr = (payload?.players || {})[name] || {};
+                              const pr = (payload?.players || {})[username] || {};
                               const tpShip = pr.shipments || null;  // {"S1>D1": q, ...}
                               const tsFlow = pr.flows || null;      // {"Hub1>D1": q, ...}
 
                               return (
-                                <li key={row.username}>
+                                <li key={username || row.id}>
                                   <button
-                                    className={"w-full text-left px-2 py-1 rounded " + (selPlayer?.username === row.username ? "bg-emerald-800" : "hover:bg-emerald-900/50")}
-                                    onClick={() => setSelPlayer(row)}
+                                    className={"w-full text-left px-2 py-1 rounded " + (selPlayer?.username === username ? "bg-emerald-800" : "hover:bg-emerald-900/50")}
+                                    onClick={() => setSelPlayer({ ...row, username, resolvedPath: resolvedPath || [], resolvedCost: cost, displayName })}
                                   >
                                     <div className="flex items-center justify-between">
-                                      <span>{name}</span>
+                                      <span>{displayName}</span>
                                       <span className="font-mono">{cost != null ? Number(cost).toFixed(2) : "—"}</span>
                                     </div>
-                                    {path && (
+                                    {resolvedPath && resolvedPath.length > 0 && (
                                       <div className="text-[11px] opacity-75 font-mono overflow-hidden text-ellipsis">
-                                        path: [{path.join(" → ")}]
+                                        path: [{resolvedPath.join(" → ")}]
                                       </div>
                                     )}
                                     {tpShip && (
