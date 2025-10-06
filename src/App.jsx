@@ -2685,13 +2685,13 @@ function RoundLeaderboardCard({ room, round }) {
   const opt = React.useMemo(() => {
     switch (round.gameMode) {
       case "sp":  return sNorm.nodes.length ? dijkstra(sNorm.nodes, graphEdges, sNorm.start, sNorm.end) : { cost: Infinity, path: [] };
-      case "tsp": return safeCall(tspOptimalCost, sNorm.nodes || []);
+      case "tsp": return safeCall(tspOptimalCost, sNorm.nodes || [], round);
       case "vrp": return safeCall(vrpOptimalCost, sNorm);
       case "tp":  return { path: [], cost: safeCall(tpOptimalCost, sNorm).cost };
       case "ts":  return { path: [], cost: safeCall(tsOptimalCost, sNorm).cost };
       default:    return safeCall(pickOptimalCost, sNorm);
     }
-  }, [round.gameMode, sNorm, graphEdges]);
+  }, [round.gameMode, round.tspOpt, round.distanceMetric, sNorm, graphEdges]);
 
   const objLabel = round.objectiveMode === "dual"
     ? `${Math.round(100 * (round.alpha ?? 0.5))}% ${round.objA} + ${Math.round(100 * (1 - (round.alpha ?? 0.5)))}% ${round.objB}`
@@ -2861,7 +2861,7 @@ function computeOptimalForPayload(scenario, payload, modeHint) {
     return dijkstra(scenario.nodes, edges, scenario.start, scenario.end);
   }
   if (mode === "tsp") {
-    return safeCall(tspOptimalCost, { cost: Infinity, path: [] }, scenario.nodes || []);
+    return safeCall(tspOptimalCost, { cost: Infinity, path: [] }, scenario.nodes || [], payload);
   }
   if (mode === "vrp") {
     return safeCall(vrpOptimalCost, { cost: Infinity, path: [] }, scenario);
@@ -5063,7 +5063,7 @@ function computeOptimalForRound(round) {
     case "sp":
       if (!Array.isArray(s.nodes) || !s.nodes.length) return { cost: Infinity, path: [] };
       return dijkstra(s.nodes, graphEdges, s.start, s.end);
-    case "tsp": return safe(tspOptimalCost, s.nodes || []);
+    case "tsp": return safe(tspOptimalCost, s.nodes || [], round);
     case "vrp": return safe(vrpOptimalCost, s);
     case "tp":  return safe(tpOptimalCost, s);            // { cost, flows }
     case "ts":  return safe(tsOptimalCost, s);            // { cost, flows }
@@ -5163,9 +5163,26 @@ function tspExactHK(nodes) {
   const ids = ["S", ...nodes.filter(n => n.id !== "S").map(n => n.id)];
   return heldKarpOnIds(ids, map, euclid);
 }
-function tspOptimalCost(nodes) {
+function tspOptimalCost(nodes, roundOrPayload = null) {
+  const list = Array.isArray(nodes?.nodes) ? nodes.nodes : nodes;
+  const arr = Array.isArray(list) ? list : [];
+  if (!arr.length) return { cost: Infinity, path: [] };
+
+  const ctx = roundOrPayload && roundOrPayload.payload
+    ? roundOrPayload.payload
+    : roundOrPayload;
+
+  const prefRaw = ctx && typeof ctx.tspOpt === "string" ? ctx.tspOpt : null;
+  const pref = ["nn", "ni", "2opt"].includes(prefRaw) ? prefRaw : null;
+
+  if (pref) {
+    return tspBaselineCost(arr, pref, ctx);
+  }
+
   // Exact up to 12 nodes (incl. S), else your NN+2opt baseline
-  return nodes.length <= 12 ? tspExactHK(nodes) : tspBaselineCost(nodes);
+  return arr.length <= 12
+    ? tspExactHK(arr)
+    : tspBaselineCost(arr, "nn", ctx);
 }
 
 // --- Picking exact (Manhattan) with fallback ---
