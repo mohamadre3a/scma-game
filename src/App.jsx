@@ -2736,9 +2736,20 @@ function RoundLeaderboardCard({ room, round }) {
 
 function SeasonLeaderboardCard({ room, season }) {
   // season totals (existing)
-    const [boardTab, setBoardTab] = useState("season"); // "season" | "day"
+  const [boardTab, setBoardTab] = useState("season"); // "season" | "day"
   const [dayTotals, setDayTotals] = useState([]);
   const todayKey = todayKeyMDT();
+
+  const [nameMap, setNameMap] = useState({});
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const map = await loadDisplayNameMap(room);
+      if (!alive) return;
+      setNameMap(map || {});
+    })();
+    return () => { alive = false; };
+  }, [room]);
 
   useEffect(() => {
   if (boardTab !== "day") return;
@@ -2916,7 +2927,38 @@ async function openHistoryRound(row) {
       score: r.score, cost: r.cost, time_sec: r.timeSec, path: r.path,
     }));
   }
-  setSubs(s || []);
+  const resolved = (s || []).map(entry => {
+    const username = entry.username || entry.user || entry.name || entry.id || "";
+    const pathArr = Array.isArray(entry.path?.path) ? entry.path.path
+      : Array.isArray(entry.path) ? entry.path
+      : null;
+    const resolvedCost = entry.cost != null
+      ? entry.cost
+      : (pathArr ? costForPayloadPath(scenario, payload, pathArr, modeHint) : null);
+    const displayName = nameMap[username] || entry.display_name || entry.name || username || "Player";
+    return {
+      ...entry,
+      username,
+      cost: resolvedCost,
+      displayName,
+    };
+  });
+
+  const num = v => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : Infinity;
+  };
+
+  resolved.sort((a, b) => {
+    const costDiff = num(a.cost) - num(b.cost);
+    if (costDiff !== 0) return costDiff;
+    const timeA = num(a.time_sec ?? a.timeSec);
+    const timeB = num(b.time_sec ?? b.timeSec);
+    if (timeA !== timeB) return timeA - timeB;
+    return (a.displayName || a.username || "").localeCompare(b.displayName || b.username || "");
+  });
+
+  setSubs(resolved);
 }
 
 
@@ -3111,7 +3153,7 @@ async function openHistoryRound(row) {
                           <div className="font-semibold mb-2">Players</div>
                           {selPlayer && (
                             <div className="mt-3 rounded-lg border border-emerald-300/20 p-2">
-                              <div className="font-semibold mb-2">History for {selPlayer.username || selPlayer.name}</div>
+                              <div className="font-semibold mb-2">History for {selPlayer.displayName || selPlayer.username || selPlayer.name}</div>
                               <ul className="text-xs space-y-1 max-h-48 overflow-auto">
                                 {playerHist.map(h => (
                                   <li key={`${h.round_id}-${h.started_at}`} className="flex items-center justify-between">
@@ -3136,25 +3178,26 @@ async function openHistoryRound(row) {
 
                           <ul className="space-y-1">
                             {subs.map(row => {
-                              const name = row.username || row.user || row.name || "Player";
+                              const username = row.username || row.user || row.name || row.id || "Player";
+                              const displayName = row.displayName || nameMap[username] || username;
                               const path = Array.isArray(row.path?.path) ? row.path.path
                               : Array.isArray(row.path) ? row.path
                               : null;
 
                               const cost = row.cost ?? (path ? costForPayloadPath(scenario, payload, path) : null);
                               // pull TP/TS quantities from the round payload
-                              const pr = (payload?.players || {})[name] || {};
+                              const pr = (payload?.players || {})[username] || {};
                               const tpShip = pr.shipments || null;  // {"S1>D1": q, ...}
                               const tsFlow = pr.flows || null;      // {"Hub1>D1": q, ...}
 
                               return (
-                                <li key={row.username}>
+                                <li key={username}>
                                   <button
                                     className={"w-full text-left px-2 py-1 rounded " + (selPlayer?.username === row.username ? "bg-emerald-800" : "hover:bg-emerald-900/50")}
                                     onClick={() => setSelPlayer(row)}
                                   >
                                     <div className="flex items-center justify-between">
-                                      <span>{name}</span>
+                                      <span>{displayName}</span>
                                       <span className="font-mono">{cost != null ? Number(cost).toFixed(2) : "—"}</span>
                                     </div>
                                     {path && (
