@@ -2773,8 +2773,19 @@ function SeasonLeaderboardCard({ room, season }) {
   const [subs, setSubs] = React.useState([]);            // submissions for selected round
   const [best, setBest] = React.useState({ path: [], cost: Infinity }); // optimal for selected
   const [selPlayer, setSelPlayer] = React.useState(null);// selected player row
+  const [nameMap, setNameMap] = React.useState({});      // username → display_name
 
   const [playerHist, setPlayerHist] = React.useState([]);
+  const compareSubs = React.useCallback((a, b) => {
+    const aCost = Number.isFinite(a?.cost) ? a.cost : Infinity;
+    const bCost = Number.isFinite(b?.cost) ? b.cost : Infinity;
+    if (aCost !== bCost) return aCost - bCost;
+    const aName = (a?.displayName || a?.username || "").toLowerCase();
+    const bName = (b?.displayName || b?.username || "").toLowerCase();
+    if (aName < bName) return -1;
+    if (aName > bName) return 1;
+    return 0;
+  }, []);
 useEffect(() => {
   let alive = true;
   (async () => {
@@ -2785,6 +2796,38 @@ useEffect(() => {
   })();
   return () => { alive = false; };
 }, [selPlayer, room]);
+
+  React.useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const map = await loadDisplayNameMap(room);
+        if (!alive) return;
+        setNameMap(map || {});
+      } catch {
+        if (!alive) return;
+        setNameMap({});
+      }
+    })();
+    return () => { alive = false; };
+  }, [room]);
+
+  React.useEffect(() => {
+    setSubs(prev => {
+      if (!prev.length) return prev;
+      let changed = false;
+      const next = prev.map(row => {
+        const username = row?.username || row?.user || row?.name || "";
+        const displayName = nameMap[username] || row?.displayName || row?.name || username || "Player";
+        if (displayName === row?.displayName) return row;
+        changed = true;
+        return { ...row, displayName };
+      });
+      if (!changed) return prev;
+      next.sort(compareSubs);
+      return next;
+    });
+  }, [nameMap, compareSubs]);
 
 
 
@@ -2836,13 +2879,20 @@ function scenarioFromPayload(payload) {
 
 
 // Compute an "optimal" for a past round (all modes) with safety
+function normalizeMode(mode, fallback = "sp") {
+  if (typeof mode === "string" && mode.trim()) return mode.trim().toLowerCase();
+  return fallback;
+}
+
 function computeOptimalForPayload(scenario, payload, modeHint) {
   if (!scenario) return { path: [], cost: Infinity };
 
-  const mode = (modeHint
-    || payload?.gameMode
-    || payload?.mode
-    || "sp");
+  const mode = normalizeMode(
+    modeHint
+      || payload?.gameMode
+      || payload?.mode,
+    "sp"
+  );
 
   if (mode === "sp") {
     if (!scenario?.nodes?.length) return { path: [], cost: Infinity };
@@ -2871,10 +2921,12 @@ function computeOptimalForPayload(scenario, payload, modeHint) {
 function costForPayloadPath(scenario, payload, playerPath, modeHint) {
   if (!Array.isArray(playerPath) || playerPath.length < 2) return null;
 
-  const mode = (modeHint
-    || payload?.gameMode
-    || payload?.mode
-    || "sp");
+  const mode = normalizeMode(
+    modeHint
+      || payload?.gameMode
+      || payload?.mode,
+    "sp"
+  );
 
   if (mode === "sp") {
     const edges = buildGraphEdges(scenario, payload);
@@ -2899,7 +2951,7 @@ async function openHistoryRound(row) {
   setSel(row);
 
   const payload = row?.payload || {};
-  const scenario = scenarioFromPayload(payload);
+  const scenario = scenarioFromPayload(payload) || row?.snapshotscenario || row?.snapshotScenario || null;
   const modeHint = row?.game_mode || row?.gameMode || payload?.gameMode;
 
   setBest(computeOptimalForPayload(scenario, payload, modeHint));
@@ -2916,7 +2968,30 @@ async function openHistoryRound(row) {
       score: r.score, cost: r.cost, time_sec: r.timeSec, path: r.path,
     }));
   }
-  setSubs(s || []);
+  const decorated = (s || []).map(raw => {
+    const username = raw?.username || raw?.user || raw?.name || "";
+    const resolvedPath = Array.isArray(raw?.path?.path) ? raw.path.path
+      : Array.isArray(raw?.path) ? raw.path
+      : null;
+    const baseCost = raw?.cost != null ? Number(raw.cost)
+      : (resolvedPath ? costForPayloadPath(scenario, payload, resolvedPath, modeHint) : null);
+    const numericCostRaw = baseCost === Infinity ? Infinity : Number(baseCost);
+    const numericCost = Number.isFinite(numericCostRaw) ? numericCostRaw : (numericCostRaw === Infinity ? Infinity : null);
+    const timeVal = raw?.time_sec ?? raw?.timeSec;
+    const numericTimeRaw = timeVal == null ? null : Number(timeVal);
+    const numericTime = Number.isFinite(numericTimeRaw) ? numericTimeRaw : null;
+    return {
+      ...raw,
+      username,
+      resolvedPath,
+      cost: numericCost,
+      time_sec: numericTime,
+      timeSec: numericTime,
+      displayName: nameMap[username] || raw?.display_name || raw?.name || username || "Player",
+    };
+  });
+  decorated.sort(compareSubs);
+  setSubs(decorated);
 }
 
 
@@ -3063,7 +3138,7 @@ async function openHistoryRound(row) {
               <div className="mt-4 rounded-lg border border-emerald-300/20 p-3">
                 {(() => {
                   const payload = sel?.payload || {};
-                  const scenario = scenarioFromPayload(payload);
+                  const scenario = scenarioFromPayload(payload) || sel?.snapshotscenario || sel?.snapshotScenario || null;
                   const isTpTs = (payload?.gameMode === "tp" || payload?.gameMode === "ts");
                     if (!isTpTs && !scenario?.nodes?.length) {
                       return <div className="opacity-70">Scenario unavailable.</div>;
@@ -3096,11 +3171,12 @@ async function openHistoryRound(row) {
   scenario={scenario}
   round={payload}
   path={
-    Array.isArray(selPlayer?.path?.path) ? selPlayer.path.path
+    Array.isArray(selPlayer?.resolvedPath) ? selPlayer.resolvedPath
+    : Array.isArray(selPlayer?.path?.path) ? selPlayer.path.path
     : Array.isArray(selPlayer?.path) ? selPlayer.path
     : []
   }
-  optPath={best.path}
+  optPath={Array.isArray(best.path) ? best.path : []}
   readonly
 />
 
@@ -3111,7 +3187,7 @@ async function openHistoryRound(row) {
                           <div className="font-semibold mb-2">Players</div>
                           {selPlayer && (
                             <div className="mt-3 rounded-lg border border-emerald-300/20 p-2">
-                              <div className="font-semibold mb-2">History for {selPlayer.username || selPlayer.name}</div>
+                              <div className="font-semibold mb-2">History for {selPlayer.displayName || selPlayer.username || selPlayer.name}</div>
                               <ul className="text-xs space-y-1 max-h-48 overflow-auto">
                                 {playerHist.map(h => (
                                   <li key={`${h.round_id}-${h.started_at}`} className="flex items-center justify-between">
@@ -3136,25 +3212,30 @@ async function openHistoryRound(row) {
 
                           <ul className="space-y-1">
                             {subs.map(row => {
-                              const name = row.username || row.user || row.name || "Player";
-                              const path = Array.isArray(row.path?.path) ? row.path.path
-                              : Array.isArray(row.path) ? row.path
-                              : null;
+                              const username = row.username || row.user || row.name || "";
+                              const displayName = row.displayName || row.name || username || "Player";
+                              const path = Array.isArray(row.resolvedPath)
+                                ? row.resolvedPath
+                                : Array.isArray(row.path?.path) ? row.path.path
+                                : Array.isArray(row.path) ? row.path
+                                : null;
 
-                              const cost = row.cost ?? (path ? costForPayloadPath(scenario, payload, path) : null);
+                              const cost = Number.isFinite(row.cost)
+                                ? row.cost
+                                : (path ? costForPayloadPath(scenario, payload, path, payload?.gameMode) : null);
                               // pull TP/TS quantities from the round payload
-                              const pr = (payload?.players || {})[name] || {};
+                              const pr = (payload?.players || {})[username] || {};
                               const tpShip = pr.shipments || null;  // {"S1>D1": q, ...}
                               const tsFlow = pr.flows || null;      // {"Hub1>D1": q, ...}
 
                               return (
-                                <li key={row.username}>
+                                <li key={username || row.id || displayName}>
                                   <button
-                                    className={"w-full text-left px-2 py-1 rounded " + (selPlayer?.username === row.username ? "bg-emerald-800" : "hover:bg-emerald-900/50")}
+                                    className={"w-full text-left px-2 py-1 rounded " + (selPlayer?.username === username ? "bg-emerald-800" : "hover:bg-emerald-900/50")}
                                     onClick={() => setSelPlayer(row)}
                                   >
                                     <div className="flex items-center justify-between">
-                                      <span>{name}</span>
+                                      <span>{displayName}</span>
                                       <span className="font-mono">{cost != null ? Number(cost).toFixed(2) : "—"}</span>
                                     </div>
                                     {path && (
